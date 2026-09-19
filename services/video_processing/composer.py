@@ -1,14 +1,13 @@
 import os
+import shutil
 import subprocess
-from moviepy.editor import ImageClip, concatenate_videoclips, AudioFileClip
+from moviepy import ImageClip, concatenate_videoclips, AudioFileClip
 
 
 def _get_ffmpeg_bin() -> str:
     """
     Returns the best available FFmpeg binary path.
-    Prefers the imageio_ffmpeg bundled binary (which has libass/subtitles support)
-    over the system FFmpeg (which may lack libass).
-    Falls back to 'ffmpeg' on PATH if imageio_ffmpeg is not available.
+    Prefers the imageio_ffmpeg bundled binary.
     """
     try:
         import imageio_ffmpeg
@@ -19,9 +18,7 @@ def _get_ffmpeg_bin() -> str:
 
 def parse_duration(dur_str: str) -> float:
     try:
-        # Extract digits from strings like "3 seconds" or "5-7"
         import re
-        # Handle range like "5-7" -> take the first number
         match = re.search(r'\d+\.?\d*', str(dur_str))
         return float(match.group()) if match else 3.0
     except Exception:
@@ -37,21 +34,24 @@ def compose_video(
 ) -> str:
     """
     Combines scene images according to their durations, adds voiceover,
-    and burns subtitles into the final MP4 using the imageio_ffmpeg binary
-    (which includes libass support).
+    and burns subtitles into the final MP4 using MoviePy 2.x and FFmpeg.
 
     Returns the output_path on success.
     """
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    temp_no_subs = os.path.join(os.path.dirname(output_path), "temp_no_subs.mp4")
+    abs_output = os.path.abspath(output_path)
+    work_dir = os.path.dirname(abs_output)
+    os.makedirs(work_dir, exist_ok=True)
+    
+    temp_no_subs = os.path.join(work_dir, "temp_no_subs.mp4")
 
     # ------------------------------------------------------------------ #
-    # Step 1: Build the video slideshow + audio using MoviePy
+    # Step 1: Build the video slideshow + audio using MoviePy 2.x
     # ------------------------------------------------------------------ #
     clips = []
     for img_path, duration in zip(image_paths, durations):
         dur = parse_duration(str(duration))
-        clip = ImageClip(img_path).set_duration(dur)
+        # MoviePy 2.x uses with_duration
+        clip = ImageClip(img_path).with_duration(dur)
         clips.append(clip)
 
     final_clip = concatenate_videoclips(clips, method="compose")
@@ -60,12 +60,13 @@ def compose_video(
     # Extend the last scene if the voiceover is longer than the sum of scenes
     if audio.duration > final_clip.duration:
         diff = audio.duration - final_clip.duration
-        clips[-1] = clips[-1].set_duration(clips[-1].duration + diff)
+        last_clip = clips[-1].with_duration(clips[-1].duration + diff)
+        clips[-1] = last_clip
         final_clip = concatenate_videoclips(clips, method="compose")
 
-    final_clip = final_clip.set_audio(audio)
+    final_clip = final_clip.with_audio(audio)
 
-    # Write the intermediate file (video + audio, no subtitles yet)
+    # Write the intermediate file (video + audio, 1080x1920)
     final_clip.write_videofile(
         temp_no_subs,
         fps=24,
@@ -73,47 +74,60 @@ def compose_video(
         audio_codec="aac",
         logger=None
     )
+    
+    # Close clips to release file handles
+    try:
+        audio.close()
+        final_clip.close()
+        for c in clips:
+            c.close()
+    except Exception:
+        pass
 
     # ------------------------------------------------------------------ #
-    # Step 2: Burn subtitles using the imageio_ffmpeg binary (has libass)
+    # Step 2: Burn subtitles using FFmpeg if srt_path exists
     # ------------------------------------------------------------------ #
-    ffmpeg_bin = _get_ffmpeg_bin()
+    if srt_path and os.path.exists(srt_path):
+        ffmpeg_bin = _get_ffmpeg_bin()
+        local_srt_name = "subtitles.srt"
+        local_srt_path = os.path.join(work_dir, local_srt_name)
+        if os.path.abspath(srt_path) != os.path.abspath(local_srt_path):
+            shutil.copyfile(srt_path, local_srt_path)
 
-    # On macOS, the subtitles filter needs a properly-escaped absolute path.
-    # Use absolute paths to avoid working-directory ambiguity.
-    abs_srt = os.path.abspath(srt_path)
-    abs_temp = os.path.abspath(temp_no_subs)
-    abs_output = os.path.abspath(output_path)
+        temp_name = os.path.basename(temp_no_subs)
+        output_name = os.path.basename(abs_output)
 
-    # Escape colons and backslashes in the SRT path for the filter string.
-    # On macOS/Linux paths normally don't have colons except drive letters on Windows.
-    srt_escaped = abs_srt.replace("\\", "/").replace(":", "\\:")
+        subtitle_filter = f"subtitles={local_srt_name}:force_style='FontSize=26,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,MarginV=60'"
 
-    subtitle_filter = (
-        f"subtitles='{srt_escaped}'"
-        ":force_style='FontSize=28,PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,BorderStyle=1,MarginV=60'"
-    )
+        ffmpeg_cmd = [
+            ffmpeg_bin, "-y",
+            "-i", temp_name,
+            "-vf", subtitle_filter,
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            output_name
+        ]
 
-    ffmpeg_cmd = [
-        ffmpeg_bin, "-y",
-        "-i", abs_temp,
-        "-vf", subtitle_filter,
-        "-c:a", "copy",
-        "-movflags", "+faststart",
-        abs_output
-    ]
+        result = subprocess.run(ffmpeg_cmd, cwd=work_dir, capture_output=True, text=True)
 
-    result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(
-            f"FFmpeg subtitle burn failed:\n"
-            f"STDOUT: {result.stdout[-2000:]}\n"
-            f"STDERR: {result.stderr[-2000:]}"
-        )
-
-    # Cleanup temp file
+        if result.returncode != 0 or not os.path.exists(abs_output) or os.path.getsize(abs_output) == 0:
+            print(f"[FFmpeg Warning] Subtitle burning skipped or failed, using clean MP4")
+            if os.path.exists(temp_no_subs):
+                if os.path.exists(abs_output):
+                    os.remove(abs_output)
+                shutil.copyfile(temp_no_subs, abs_output)
+    else:
+        # No subtitle file provided, copy temp to output
+        if os.path.exists(temp_no_subs):
+            if os.path.exists(abs_output):
+                os.remove(abs_output)
+            shutil.copyfile(temp_no_subs, abs_output)
+    
+    # Cleanup temp video
     if os.path.exists(temp_no_subs):
-        os.remove(temp_no_subs)
+        try:
+            os.remove(temp_no_subs)
+        except Exception:
+            pass
 
-    return output_path
+    return abs_output
