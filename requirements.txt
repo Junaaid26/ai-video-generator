@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+streamlit
+sqlalchemy
+pydantic
+python-dotenv
+alembic
+google-genai
+moviepy
+openai-whisper
+edge-tts
+Pillow
+torch
+torchaudio
+imageio_ffmpeg
+httpx
