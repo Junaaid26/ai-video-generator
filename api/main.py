@@ -1,57 +1,75 @@
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Header, Query
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from typing import List
-import json
+from typing import List, Optional, Dict, Any
 import os
+import json
+from datetime import datetime
+
 from . import models, schemas, database
 from services.llm.agent import generate_video_plan
 from services.tts.generator import generate_voiceover
 from services.visuals.mock_generator import generate_mock_scene_image
 from services.subtitles.transcriber import generate_subtitles
 from services.video_processing.composer import compose_video
+from social import SocialProviderRegistry, encrypt_token, decrypt_token
 
-# Create the database tables on startup
+# Ensure tables are created
 models.Base.metadata.create_all(bind=database.engine)
 
-app = FastAPI(title="AI Video Automation API")
+app = FastAPI(title="AI Video Automation API - Phase 5")
 
 # Serve assets folder
 os.makedirs("assets", exist_ok=True)
 app.mount("/assets", StaticFiles(directory="assets"), name="assets")
 
+
+def verify_admin_auth(x_admin_role: Optional[str] = Header(default="admin")):
+    """
+    Authorization dependency: verifies the requester is an authorized admin.
+    Defaults to 'admin' for easy local testing, but rejects non-admin roles.
+    """
+    if x_admin_role and x_admin_role.lower() != "admin":
+        raise HTTPException(status_code=403, detail="Unauthorized: Admin privileges required")
+    return True
+
+
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to the AI Social Media Video Automation API"}
+    return {"message": "AI Video Automation API with Phase 4 Admin Review is running"}
+
 
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "API is running smoothly!"}
 
-# Example CRUD for videos
+
+# ---------------------------------------------------------------------- #
+# Video Creation & Plan Generation (Initial state: DRAFT)
+# ---------------------------------------------------------------------- #
 @app.post("/videos/", response_model=schemas.VideoResponse)
 def create_video(video: schemas.VideoCreate, db: Session = Depends(database.get_db)):
-    # 1. Create initial pending video record
+    # 1. Create initial draft video record
     try:
         db_video = models.Video(
-            prompt=video.prompt, 
+            prompt=video.prompt,
             duration=video.duration,
             language=video.language,
             style=video.style,
             target_platform=video.target_platform,
             owner_id=1,
-            status=models.VideoStatus.GENERATING
-        ) 
+            status=models.VideoStatus.DRAFT,
+            generation_stage="NOT_STARTED",
+            resolution="1080x1920"
+        )
         db.add(db_video)
         db.commit()
         db.refresh(db_video)
     except Exception as e:
         db.rollback()
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Database error during video creation: {str(e)}")
-    
-    # 2. Call LLM Service (Synchronous for now to return immediately in response)
+
+    # 2. Call LLM Service to create initial plan & script
     try:
         plan = generate_video_plan(
             prompt=video.prompt,
@@ -60,122 +78,844 @@ def create_video(video: schemas.VideoCreate, db: Session = Depends(database.get_
             style=video.style,
             target_platform=video.target_platform
         )
-        
-        # 3. Save structured plan to DB
-        db_video.plan = plan.model_dump()
+
+        plan_dict = plan.model_dump()
+        db_video.plan = plan_dict
+        db_video.original_plan = plan_dict  # Preserve pristine original
+        db_video.title = plan.title
         db_video.script = plan.complete_narration
-        db_video.status = models.VideoStatus.NEEDS_REVIEW
+        db_video.caption = plan.caption
+        db_video.hashtags = plan.hashtags
+        db_video.status = models.VideoStatus.DRAFT
         db.commit()
         db.refresh(db_video)
-        
-    except ValueError as e:
-        # e.g., missing API key
-        db_video.status = models.VideoStatus.ERROR
+
+    except Exception as e:
+        db_video.status = models.VideoStatus.FAILED
+        db_video.error_message = f"LLM Generation failed: {str(e)}"
         db.commit()
         raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        db_video.status = models.VideoStatus.ERROR
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"LLM Generation failed: {str(e)}")
-    
+
     return db_video
 
+
+# ---------------------------------------------------------------------- #
+# QA & Validation Engine
+# ---------------------------------------------------------------------- #
+def run_qa_validation(video_id: int, db: Session) -> bool:
+    """
+    Validates generated video:
+    - Checks file presence and size
+    - Reads playable duration and resolution
+    - Validates presence of title, narration, scenes
+    Updates video status to PENDING_APPROVAL on pass or FAILED on error.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        return False
+
+    video.status = models.VideoStatus.QA_PENDING
+    db.commit()
+
+    qa_report = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "checks": {},
+        "passed": False
+    }
+
+    # Check 1: Video file on disk
+    video_path = video.video_path
+    if not video_path or not os.path.exists(video_path):
+        qa_report["checks"]["file_exists"] = False
+        qa_report["error"] = "Video file does not exist on disk"
+        video.qa_report = qa_report
+        video.status = models.VideoStatus.FAILED
+        video.error_message = qa_report["error"]
+        db.commit()
+        return False
+
+    file_size = os.path.getsize(video_path)
+    qa_report["checks"]["file_exists"] = True
+    qa_report["checks"]["file_size_bytes"] = file_size
+
+    if file_size < 1000:
+        qa_report["checks"]["file_size_valid"] = False
+        qa_report["error"] = "Video file is corrupted or empty"
+        video.qa_report = qa_report
+        video.status = models.VideoStatus.FAILED
+        video.error_message = qa_report["error"]
+        db.commit()
+        return False
+    qa_report["checks"]["file_size_valid"] = True
+
+    # Check 2: Playability & Duration
+    try:
+        from moviepy import VideoFileClip
+        clip = VideoFileClip(video_path)
+        duration = clip.duration
+        resolution = f"{clip.size[0]}x{clip.size[1]}"
+        has_audio = clip.audio is not None
+        clip.close()
+
+        qa_report["checks"]["playable"] = True
+        qa_report["checks"]["duration_seconds"] = round(duration, 2)
+        qa_report["checks"]["resolution"] = resolution
+        qa_report["checks"]["has_audio"] = has_audio
+    except Exception as e:
+        qa_report["checks"]["playable"] = False
+        qa_report["error"] = f"Video playback check failed: {str(e)}"
+        video.qa_report = qa_report
+        video.status = models.VideoStatus.FAILED
+        video.error_message = qa_report["error"]
+        db.commit()
+        return False
+
+    # Check 3: Metadata completeness
+    plan = video.plan or {}
+    has_title = bool(video.title or plan.get("title"))
+    has_script = bool(video.script or plan.get("complete_narration"))
+    has_scenes = bool(plan.get("scenes"))
+
+    qa_report["checks"]["has_title"] = has_title
+    qa_report["checks"]["has_script"] = has_script
+    qa_report["checks"]["has_scenes"] = has_scenes
+
+    if not (has_title and has_script and has_scenes):
+        qa_report["error"] = "Video metadata incomplete (missing title, script, or scenes)"
+        video.qa_report = qa_report
+        video.status = models.VideoStatus.FAILED
+        video.error_message = qa_report["error"]
+        db.commit()
+        return False
+
+    # Passed QA -> Transition to PENDING_APPROVAL
+    qa_report["passed"] = True
+    qa_report["summary"] = f"Passed QA: {resolution}, {round(duration, 1)}s, audio OK"
+    video.qa_report = qa_report
+    video.status = models.VideoStatus.PENDING_APPROVAL
+    video.generation_stage = "DONE"
+    video.error_message = None
+    video.updated_at = datetime.utcnow()
+    db.commit()
+    return True
+
+
+# ---------------------------------------------------------------------- #
+# Background Pipeline Execution
+# ---------------------------------------------------------------------- #
 def run_video_pipeline(video_id: int):
     db = database.SessionLocal()
     try:
         video = db.query(models.Video).filter(models.Video.id == video_id).first()
         if not video or not video.plan:
             return
-            
-        try:
-            video.status = models.VideoStatus.GENERATING
-            db.commit()
-            
-            plan = video.plan
-            base_dir = f"assets/video_{video_id}"
-            
-            # Helper to check if a stage needs to run
-            def should_run(stage_name: str) -> bool:
-                stages = ["NOT_STARTED", "VOICEOVER", "SUBTITLES", "VISUALS", "COMPOSING", "DONE"]
-                try:
-                    current_idx = stages.index(video.generation_stage)
-                    target_idx = stages.index(stage_name)
-                    return current_idx <= target_idx
-                except ValueError:
-                    return True
 
+        # Record Generation Attempt
+        attempt_count = db.query(models.GenerationAttempt).filter(models.GenerationAttempt.video_id == video_id).count() + 1
+        attempt = models.GenerationAttempt(
+            video_id=video_id,
+            attempt_number=attempt_count,
+            stage="VOICEOVER",
+            status="STARTED",
+            started_at=datetime.utcnow()
+        )
+        db.add(attempt)
+        
+        video.status = models.VideoStatus.GENERATING
+        video.error_message = None
+        video.updated_at = datetime.utcnow()
+        db.commit()
+
+        plan = video.plan
+        base_dir = f"assets/video_{video_id}"
+        os.makedirs(base_dir, exist_ok=True)
+
+        try:
             # 1. Voiceover
-            if should_run("VOICEOVER"):
-                video.generation_stage = "VOICEOVER"
-                db.commit()
-                audio_path = os.path.join(base_dir, "voiceover.mp3")
-                generate_voiceover(plan.get("complete_narration", ""), audio_path)
-                video.audio_path = audio_path
-                db.commit()
-            
+            video.generation_stage = "VOICEOVER"
+            attempt.stage = "VOICEOVER"
+            db.commit()
+            audio_path = os.path.join(base_dir, "voiceover.mp3")
+            narration = video.script or plan.get("complete_narration", "")
+            generate_voiceover(narration, audio_path)
+            video.audio_path = audio_path
+            db.commit()
+
             # 2. Subtitles
-            if should_run("SUBTITLES"):
-                video.generation_stage = "SUBTITLES"
-                db.commit()
-                # Use existing audio path
-                audio_path = video.audio_path or os.path.join(base_dir, "voiceover.mp3")
-                srt_path = generate_subtitles(audio_path, base_dir, "voiceover")
-                video.subtitles_path = srt_path
-                db.commit()
-            
+            video.generation_stage = "SUBTITLES"
+            attempt.stage = "SUBTITLES"
+            db.commit()
+            srt_path = generate_subtitles(audio_path, base_dir, "voiceover", fallback_text=narration)
+            video.subtitles_path = srt_path
+            db.commit()
+
             # 3. Visuals
-            if should_run("VISUALS"):
-                video.generation_stage = "VISUALS"
-                db.commit()
-                image_paths = []
-                durations = []
-                for i, scene in enumerate(plan.get("scenes", [])):
-                    img_path = os.path.join(base_dir, f"scene_{i}.jpg")
-                    generate_mock_scene_image(scene.get("visual_description", ""), img_path)
-                    image_paths.append(img_path)
-                    durations.append(scene.get("scene_duration", "3"))
-                
-                # Store paths in DB or just infer them in the next step
-                # For simplicity, we can infer them from the plan in the next step
-                
+            video.generation_stage = "VISUALS"
+            attempt.stage = "VISUALS"
+            db.commit()
+            image_paths = []
+            durations = []
+            scenes = plan.get("scenes", [])
+            for i, scene in enumerate(scenes):
+                img_path = os.path.join(base_dir, f"scene_{i}.jpg")
+                generate_mock_scene_image(scene.get("visual_description", f"Scene {i+1}"), img_path)
+                image_paths.append(img_path)
+                durations.append(scene.get("scene_duration", "4"))
+
             # 4. Compose
-            if should_run("COMPOSING"):
-                video.generation_stage = "COMPOSING"
-                db.commit()
-                # Rebuild paths if resuming
-                image_paths = [os.path.join(base_dir, f"scene_{i}.jpg") for i in range(len(plan.get("scenes", [])))]
-                durations = [scene.get("scene_duration", "3") for scene in plan.get("scenes", [])]
-                audio_path = video.audio_path or os.path.join(base_dir, "voiceover.mp3")
-                srt_path = video.subtitles_path or os.path.join(base_dir, "voiceover.srt")
-                
-                final_mp4 = os.path.join(base_dir, "final.mp4")
-                compose_video(image_paths, durations, audio_path, srt_path, final_mp4)
-                video.video_path = final_mp4
-                
-                video.generation_stage = "DONE"
-                video.status = models.VideoStatus.APPROVED
-                video.error_message = None
-                db.commit()
-            
+            video.generation_stage = "COMPOSING"
+            attempt.stage = "COMPOSING"
+            db.commit()
+
+            final_mp4 = os.path.join(base_dir, "final.mp4")
+            compose_video(image_paths, durations, audio_path, srt_path, final_mp4)
+            video.video_path = final_mp4
+            video.video_url = f"/assets/video_{video_id}/final.mp4"
+            video.status = models.VideoStatus.GENERATED
+            db.commit()
+
+            attempt.status = "COMPLETED"
+            attempt.completed_at = datetime.utcnow()
+            db.commit()
+
+            # 5. QA / Validation -> transitions to PENDING_APPROVAL
+            run_qa_validation(video_id, db)
+
         except Exception as e:
             import traceback
             traceback.print_exc()
-            video.status = models.VideoStatus.ERROR
+            video.status = models.VideoStatus.FAILED
             video.error_message = str(e)
+            attempt.status = "FAILED"
+            attempt.error_message = str(e)
+            attempt.completed_at = datetime.utcnow()
             db.commit()
+
     finally:
         db.close()
+
 
 @app.post("/videos/{video_id}/generate")
 def start_generation(video_id: int, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db)):
     video = db.query(models.Video).filter(models.Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-        
-    background_tasks.add_task(run_video_pipeline, video_id)
-    return {"status": "started"}
 
+    video.status = models.VideoStatus.GENERATING
+    db.commit()
+    background_tasks.add_task(run_video_pipeline, video_id)
+    return {"status": "started", "video_id": video_id}
+
+
+# ---------------------------------------------------------------------- #
+# Phase 4: Admin Review & Approval Endpoints
+# ---------------------------------------------------------------------- #
+@app.post("/videos/{video_id}/approve", response_model=schemas.VideoResponse)
+def approve_video(
+    video_id: int,
+    db: Session = Depends(database.get_db),
+    authorized: bool = Depends(verify_admin_auth)
+):
+    """
+    Admin APPROVE action:
+    - Validates that the video file exists and is playable.
+    - Validates that required metadata exists.
+    - Transitions status to APPROVED.
+    - Does NOT publish anything yet.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # 1. Validation: video exists on disk
+    if not video.video_path or not os.path.exists(video.video_path):
+        raise HTTPException(status_code=400, detail="Cannot approve: Video file does not exist on disk.")
+
+    if os.path.getsize(video.video_path) < 1000:
+        raise HTTPException(status_code=400, detail="Cannot approve: Video file is empty or corrupted.")
+
+    # 2. Validation: required metadata exists
+    plan = video.plan or {}
+    if not (video.title or plan.get("title")):
+        raise HTTPException(status_code=400, detail="Cannot approve: Title metadata is missing.")
+    if not (video.script or plan.get("complete_narration")):
+        raise HTTPException(status_code=400, detail="Cannot approve: Script metadata is missing.")
+
+    # 3. Record Approval
+    approval = models.Approval(
+        video_id=video.id,
+        reviewer_id=1,
+        action="APPROVED",
+        is_approved=True,
+        comments="Approved by admin review",
+        reviewed_at=datetime.utcnow()
+    )
+    db.add(approval)
+
+    # 4. Update status
+    video.status = models.VideoStatus.APPROVED
+    video.rejection_reason = None
+    video.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(video)
+
+    return video
+
+
+@app.post("/videos/{video_id}/reject", response_model=schemas.VideoResponse)
+def reject_video(
+    video_id: int,
+    action_data: schemas.ApprovalAction,
+    db: Session = Depends(database.get_db),
+    authorized: bool = Depends(verify_admin_auth)
+):
+    """
+    Admin REJECT action:
+    - Stores optional rejection reason in DB.
+    - Changes status to REJECTED.
+    - Allows subsequent regeneration.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    reason = action_data.rejection_reason or action_data.comments or "Rejected during admin review."
+
+    # Record rejection in approvals table
+    approval = models.Approval(
+        video_id=video.id,
+        reviewer_id=1,
+        action="REJECTED",
+        is_approved=False,
+        rejection_reason=reason,
+        comments=action_data.comments,
+        reviewed_at=datetime.utcnow()
+    )
+    db.add(approval)
+
+    video.status = models.VideoStatus.REJECTED
+    video.rejection_reason = reason
+    video.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(video)
+
+    return video
+
+
+@app.post("/videos/{video_id}/regenerate")
+def regenerate_video(
+    video_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+    authorized: bool = Depends(verify_admin_auth)
+):
+    """
+    Admin/User REGENERATE action:
+    - Resets status to GENERATING.
+    - Restarts the generation pipeline.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    video.status = models.VideoStatus.GENERATING
+    video.error_message = None
+    video.rejection_reason = None
+    video.updated_at = datetime.utcnow()
+    db.commit()
+
+    background_tasks.add_task(run_video_pipeline, video_id)
+    return {"status": "regenerating", "video_id": video_id}
+
+
+@app.put("/videos/{video_id}/content", response_model=schemas.VideoResponse)
+def update_video_content(
+    video_id: int,
+    update_data: schemas.VideoUpdate,
+    db: Session = Depends(database.get_db),
+    authorized: bool = Depends(verify_admin_auth)
+):
+    """
+    Admin EDIT CONTENT action:
+    - Saves edits to title, script, caption, hashtags, or scene breakdown.
+    - Preserves original_plan without overwriting it.
+    - Updates updated_at timestamp.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # Preserve original plan if not yet preserved
+    if not video.original_plan and video.plan:
+        video.original_plan = dict(video.plan)
+
+    plan = dict(video.plan or {})
+
+    if update_data.title is not None:
+        video.title = update_data.title
+        plan["title"] = update_data.title
+
+    if update_data.short_description is not None:
+        plan["short_description"] = update_data.short_description
+
+    if update_data.complete_narration is not None:
+        video.script = update_data.complete_narration
+        plan["complete_narration"] = update_data.complete_narration
+
+    if update_data.caption is not None:
+        video.caption = update_data.caption
+        plan["caption"] = update_data.caption
+
+    if update_data.hashtags is not None:
+        video.hashtags = update_data.hashtags
+        plan["hashtags"] = update_data.hashtags
+
+    if update_data.scenes is not None:
+        plan["scenes"] = [s.model_dump() for s in update_data.scenes]
+
+    video.plan = plan
+    video.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(video)
+
+    return video
+
+
+# ---------------------------------------------------------------------- #
+# Listing & Detail Endpoints
+# ---------------------------------------------------------------------- #
 @app.get("/videos/", response_model=List[schemas.VideoResponse])
-def get_videos(skip: int = 0, limit: int = 100, db: Session = Depends(database.get_db)):
-    videos = db.query(models.Video).offset(skip).limit(limit).all()
+def get_videos(
+    status: Optional[str] = Query(None, description="Filter by status (e.g. PENDING_APPROVAL)"),
+    skip: int = 0,
+    limit: int = 100,
+    db: Session = Depends(database.get_db)
+):
+    query = db.query(models.Video)
+    if status:
+        # Match case-insensitively
+        status_upper = status.upper()
+        query = query.filter(models.Video.status == status_upper)
+
+    videos = query.order_by(models.Video.id.desc()).offset(skip).limit(limit).all()
     return videos
+
+
+@app.get("/videos/{video_id}", response_model=schemas.VideoResponse)
+def get_video(video_id: int, db: Session = Depends(database.get_db)):
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    return video
+
+
+@app.get("/videos/{video_id}/audit_log", response_model=schemas.AuditLogResponse)
+def get_audit_log(video_id: int, db: Session = Depends(database.get_db)):
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    approvals = db.query(models.Approval).filter(models.Approval.video_id == video_id).order_by(models.Approval.reviewed_at.desc()).all()
+    attempts = db.query(models.GenerationAttempt).filter(models.GenerationAttempt.video_id == video_id).order_by(models.GenerationAttempt.attempt_number.asc()).all()
+    
+    return {
+        "video_id": video_id,
+        "approvals": approvals,
+        "generation_attempts": attempts
+    }
+
+
+# ---------------------------------------------------------------------- #
+# Phase 5: Social Media Account Connection & Platform Selection Endpoints
+# ---------------------------------------------------------------------- #
+
+@app.get("/social/platforms")
+def get_supported_social_platforms():
+    """
+    Returns all supported platforms, capability specs, $0-cost status,
+    developer registration requirements, and current configuration state.
+    """
+    return SocialProviderRegistry.list_all_platforms()
+
+
+@app.get("/social/oauth/authorize/{platform}")
+def get_social_oauth_authorization_url(
+    platform: str,
+    redirect_uri: str = Query(..., description="Redirect URI for OAuth callback"),
+    sandbox: bool = Query(False, description="Use sandbox mock provider instead of official API")
+):
+    """
+    Generates official OAuth consent URL (or sandbox redirect) for the platform.
+    """
+    try:
+        provider = SocialProviderRegistry.get_provider(platform, use_sandbox=sandbox)
+        import secrets
+        csrf_state = secrets.token_urlsafe(16)
+        auth_url = provider.get_authorization_url(state=csrf_state, redirect_uri=redirect_uri)
+        return {"authorization_url": auth_url, "state": csrf_state, "platform": platform, "is_sandbox": sandbox}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/social/oauth/callback/{platform}")
+def handle_social_oauth_callback(
+    platform: str,
+    code: str = Query(..., description="Authorization code from OAuth provider"),
+    redirect_uri: str = Query(..., description="Redirect URI used in authorization"),
+    state: Optional[str] = Query(None),
+    sandbox: bool = Query(False),
+    db: Session = Depends(database.get_db)
+):
+    """
+    Exchanges OAuth code for access/refresh tokens, gets channel/profile info,
+    encrypts credentials, and persists to social_accounts table.
+    """
+    try:
+        provider = SocialProviderRegistry.get_provider(platform, use_sandbox=sandbox)
+        token_data = provider.exchange_code_for_tokens(code=code, redirect_uri=redirect_uri)
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+        expires_in = token_data.get("expires_in")
+        
+        info = provider.get_account_info(access_token)
+
+        # Calculate expires_at if applicable
+        token_expires_at = None
+        if expires_in:
+            from datetime import timedelta
+            token_expires_at = datetime.utcnow() + timedelta(seconds=expires_in)
+
+        # Check for existing account to update or create new
+        account = db.query(models.SocialAccount).filter(
+            models.SocialAccount.platform == platform.lower(),
+            models.SocialAccount.account_id == info.get("account_id")
+        ).first()
+
+        if not account:
+            account = models.SocialAccount(
+                user_id=1,
+                platform=platform.lower(),
+                account_id=info.get("account_id"),
+                is_mock=sandbox
+            )
+            db.add(account)
+
+        account.account_name = info.get("account_name")
+        account.account_handle = info.get("account_handle")
+        # Store ONLY encrypted tokens! Never plain text
+        account.encrypted_access_token = encrypt_token(access_token)
+        account.encrypted_refresh_token = encrypt_token(refresh_token) if refresh_token else account.encrypted_refresh_token
+        account.token_expires_at = token_expires_at
+        account.status = "ACTIVE"
+        account.metadata_json = {
+            "avatar_url": info.get("avatar_url"),
+            "profile_url": info.get("profile_url")
+        }
+        account.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(account)
+
+        return {
+            "id": account.id,
+            "platform": account.platform,
+            "account_name": account.account_name,
+            "account_handle": account.account_handle,
+            "status": account.status,
+            "is_mock": account.is_mock,
+            "metadata_json": account.metadata_json,
+            "created_at": account.created_at
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"OAuth connection failed: {str(e)}")
+
+
+@app.post("/social/accounts/sandbox", response_model=schemas.SocialAccountResponse)
+def connect_sandbox_account(
+    account_in: schemas.SocialAccountCreateSandbox,
+    db: Session = Depends(database.get_db)
+):
+    """
+    Connects an explicit Sandbox account without needing external developer credentials.
+    Enforces the exact same validation constraints as the real provider.
+    """
+    platform = account_in.platform.lower().strip()
+    if platform not in SocialProviderRegistry.SUPPORTED_PLATFORMS:
+        raise HTTPException(status_code=400, detail=f"Unsupported platform: {platform}")
+
+    mock_provider = SocialProviderRegistry.get_provider(platform, use_sandbox=True)
+    tokens = mock_provider.exchange_code_for_tokens("sandbox_code", "http://localhost")
+    info = mock_provider.get_account_info(tokens["access_token"])
+
+    acc_name = account_in.account_name or info.get("account_name")
+    acc_handle = account_in.account_handle or info.get("account_handle")
+
+    # Check if a sandbox account for this platform already exists
+    account = db.query(models.SocialAccount).filter(
+        models.SocialAccount.platform == platform,
+        models.SocialAccount.is_mock == True
+    ).first()
+
+    if not account:
+        account = models.SocialAccount(
+            user_id=1,
+            platform=platform,
+            account_id=info.get("account_id"),
+            is_mock=True
+        )
+        db.add(account)
+
+    account.account_name = acc_name
+    account.account_handle = acc_handle
+    account.encrypted_access_token = encrypt_token(tokens["access_token"])
+    account.encrypted_refresh_token = encrypt_token(tokens.get("refresh_token"))
+    account.status = "ACTIVE"
+    account.metadata_json = {
+        "avatar_url": info.get("avatar_url"),
+        "profile_url": info.get("profile_url")
+    }
+    account.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(account)
+
+    return account
+
+
+@app.get("/social/accounts", response_model=List[schemas.SocialAccountResponse])
+def get_connected_accounts(
+    platform: Optional[str] = None,
+    db: Session = Depends(database.get_db)
+):
+    """
+    Lists all connected social accounts for the user.
+    Tokens are NEVER returned in this response.
+    """
+    query = db.query(models.SocialAccount)
+    if platform:
+        query = query.filter(models.SocialAccount.platform == platform.lower().strip())
+    accounts = query.order_by(models.SocialAccount.id.asc()).all()
+    return accounts
+
+
+@app.delete("/social/accounts/{account_id}")
+def disconnect_social_account(
+    account_id: int,
+    db: Session = Depends(database.get_db)
+):
+    """
+    Disconnects/removes a connected social account.
+    """
+    account = db.query(models.SocialAccount).filter(models.SocialAccount.id == account_id).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Social account not found")
+
+    db.delete(account)
+    db.commit()
+    return {"status": "disconnected", "account_id": account_id}
+
+
+# ---------------------------------------------------------------------- #
+# Publishing Configuration & Validation Endpoints
+# ---------------------------------------------------------------------- #
+
+@app.get("/videos/{video_id}/publishing-config", response_model=Optional[schemas.PublishingConfigResponse])
+def get_video_publishing_config(
+    video_id: int,
+    db: Session = Depends(database.get_db)
+):
+    """
+    Retrieves the current publishing configuration for an approved video.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    config = db.query(models.PublishingConfiguration).filter(
+        models.PublishingConfiguration.video_id == video_id
+    ).order_by(models.PublishingConfiguration.id.desc()).first()
+
+    return config
+
+
+@app.post("/videos/{video_id}/publishing-config", response_model=schemas.PublishingConfigResponse)
+def save_video_publishing_config(
+    video_id: int,
+    payload: schemas.PublishingConfigCreate,
+    validate: bool = Query(False, description="Run validation immediately after saving"),
+    db: Session = Depends(database.get_db)
+):
+    """
+    Saves or updates the publishing configuration and platform settings for a video.
+    Tracks: Video -> PublishingConfiguration -> Platform -> ConnectedAccount -> PlatformMetadata -> Status.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # Video must be approved before saving publishing config
+    if video.status not in [models.VideoStatus.APPROVED, models.VideoStatus.READY_TO_SCHEDULE]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot configure publishing for video in '{video.status}' status. Video must be APPROVED first."
+        )
+
+    # Find or create PublishingConfiguration
+    config = db.query(models.PublishingConfiguration).filter(
+        models.PublishingConfiguration.video_id == video_id
+    ).first()
+
+    if not config:
+        config = models.PublishingConfiguration(
+            video_id=video_id,
+            status="DRAFT"
+        )
+        db.add(config)
+        db.commit()
+        db.refresh(config)
+
+    # Clear old settings and re-create from payload
+    db.query(models.PlatformPublishingSetting).filter(
+        models.PlatformPublishingSetting.configuration_id == config.id
+    ).delete()
+
+    for s_in in payload.settings:
+        setting = models.PlatformPublishingSetting(
+            configuration_id=config.id,
+            platform=s_in.platform.lower().strip(),
+            account_id=s_in.account_id,
+            platform_metadata=s_in.platform_metadata,
+            status="CONFIGURED",
+            is_validated=False
+        )
+        db.add(setting)
+
+    config.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(config)
+
+    if validate:
+        # Run validation logic immediately
+        validate_video_publishing_config(video_id=video_id, db=db)
+        db.refresh(config)
+
+    return config
+
+
+@app.post("/videos/{video_id}/publishing-config/validate", response_model=schemas.PublishingValidationResult)
+def validate_video_publishing_config(
+    video_id: int,
+    db: Session = Depends(database.get_db)
+):
+    """
+    Validates publishing configuration before a video can proceed:
+    1. Video exists
+    2. Video is approved (status APPROVED or READY_TO_SCHEDULE)
+    3. Video file exists on disk
+    4. Connected social account exists and is ACTIVE for each selected platform
+    5. Required platform metadata exists and adheres to platform constraints
+    6. If all pass -> marks config as READY_TO_SCHEDULE and video as READY_TO_SCHEDULE!
+    7. If any fail -> returns structured platform-specific errors.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    # 1 & 2. Video is approved
+    if video.status not in [models.VideoStatus.APPROVED, models.VideoStatus.READY_TO_SCHEDULE]:
+        return schemas.PublishingValidationResult(
+            is_valid=False,
+            status="FAILED",
+            video_id=video_id,
+            errors={"video": [f"Video is not approved (current status: {video.status}). Only APPROVED videos can be scheduled."]},
+            message="Video must be approved before configuring publishing."
+        )
+
+    # 3. Video file exists on disk
+    if not video.video_path or not os.path.exists(video.video_path):
+        return schemas.PublishingValidationResult(
+            is_valid=False,
+            status="FAILED",
+            video_id=video_id,
+            errors={"video": ["Video file does not exist on disk or has not been generated."]},
+            message="Video file is missing."
+        )
+
+    config = db.query(models.PublishingConfiguration).filter(
+        models.PublishingConfiguration.video_id == video_id
+    ).first()
+
+    if not config or not config.settings:
+        return schemas.PublishingValidationResult(
+            is_valid=False,
+            status="FAILED",
+            video_id=video_id,
+            errors={"platforms": ["No social media platforms have been selected or configured."]},
+            message="Please select at least one social media platform."
+        )
+
+    all_errors: Dict[str, List[str]] = {}
+    total_settings = len(config.settings)
+    validated_count = 0
+
+    for setting in config.settings:
+        plat = setting.platform.lower().strip()
+        p_errors: List[str] = []
+
+        # 4. Connected account exists and is active
+        account = db.query(models.SocialAccount).filter(
+            models.SocialAccount.id == setting.account_id
+        ).first()
+
+        if not account:
+            p_errors.append(f"No connected account linked for {plat.capitalize()}. Please connect an account first.")
+        elif account.status != "ACTIVE":
+            p_errors.append(f"Connected account '{account.account_name}' ({plat.capitalize()}) is {account.status}. Please reconnect.")
+
+        # 5. Metadata validation against official platform provider rules
+        meta = setting.platform_metadata or {}
+        is_val, val_errs = SocialProviderRegistry.validate_metadata(
+            platform=plat,
+            metadata=meta,
+            video_path=video.video_path
+        )
+        p_errors.extend(val_errs)
+
+        # Update setting state
+        setting.validation_errors = p_errors
+        setting.is_validated = (len(p_errors) == 0)
+        setting.status = "VALIDATED" if setting.is_validated else "ERROR"
+        setting.updated_at = datetime.utcnow()
+
+        if p_errors:
+            all_errors[plat] = p_errors
+        else:
+            validated_count += 1
+
+    if all_errors:
+        config.status = "FAILED"
+        db.commit()
+        return schemas.PublishingValidationResult(
+            is_valid=False,
+            status="FAILED",
+            video_id=video_id,
+            configuration_id=config.id,
+            errors=all_errors,
+            message="Validation failed for one or more platforms. Please correct the errors."
+        )
+
+    # All platforms passed validation!
+    # Transition milestone: READY_TO_SCHEDULE
+    config.status = "READY_TO_SCHEDULE"
+    video.status = models.VideoStatus.READY_TO_SCHEDULE
+    video.updated_at = datetime.utcnow()
+    db.commit()
+
+    return schemas.PublishingValidationResult(
+        is_valid=True,
+        status="READY_TO_SCHEDULE",
+        video_id=video_id,
+        configuration_id=config.id,
+        errors={},
+        message=f"Success! All {validated_count} platform configuration(s) are validated. Video is Ready to Schedule!"
+    )
+
+
