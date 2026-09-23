@@ -53,6 +53,11 @@ class Video(Base):
     audio_path = Column(String, nullable=True)
     video_path = Column(String, nullable=True)
     subtitles_path = Column(String, nullable=True)
+
+    # Visual generation
+    visual_style = Column(String, default="realistic")
+    visual_provider = Column(String, nullable=True)
+    visual_generation_status = Column(JSON, nullable=True)
     
     # Lifecycle and QA
     status = Column(Enum(VideoStatus, values_callable=lambda obj: [e.value for e in obj]), default=VideoStatus.DRAFT)
@@ -71,8 +76,28 @@ class Video(Base):
     owner = relationship("User", back_populates="videos")
     approvals = relationship("Approval", back_populates="video", cascade="all, delete-orphan")
     generation_attempts = relationship("GenerationAttempt", back_populates="video", cascade="all, delete-orphan")
+    scene_assets = relationship("SceneAsset", back_populates="video", cascade="all, delete-orphan")
     scheduled_posts = relationship("ScheduledPost", back_populates="video", cascade="all, delete-orphan")
     publishing_configurations = relationship("PublishingConfiguration", back_populates="video", cascade="all, delete-orphan")
+
+
+class SceneAsset(Base):
+    __tablename__ = "scene_assets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id"), index=True)
+    scene_number = Column(Integer, nullable=False)
+    image_path = Column(String, nullable=True)
+    visual_prompt = Column(Text, nullable=True)
+    status = Column(String, default="pending")  # pending, generating, completed, failed
+    provider = Column(String, nullable=True)
+    is_mock = Column(Boolean, default=False)
+    error_message = Column(Text, nullable=True)
+    metadata_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    video = relationship("Video", back_populates="scene_assets")
 
 class Approval(Base):
     __tablename__ = "approvals"

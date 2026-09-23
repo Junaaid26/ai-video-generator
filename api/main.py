@@ -9,13 +9,41 @@ from datetime import datetime
 from . import models, schemas, database
 from services.llm.agent import generate_video_plan
 from services.tts.generator import generate_voiceover
-from services.visuals.mock_generator import generate_mock_scene_image
 from services.subtitles.transcriber import generate_subtitles
 from services.video_processing.composer import compose_video
+from services.visual_generation import VisualGenerationService, get_visual_provider
+from services.visual_generation.pipeline_helpers import (
+    generate_scene_visuals,
+    regenerate_single_scene,
+    init_visual_status,
+    update_scene_status,
+    scene_image_path,
+)
 from social import SocialProviderRegistry, encrypt_token, decrypt_token
 
-# Ensure tables are created
+# Ensure tables are created and migrated
 models.Base.metadata.create_all(bind=database.engine)
+
+
+def _migrate_schema():
+    """Add new columns to existing SQLite databases."""
+    from sqlalchemy import inspect, text
+    inspector = inspect(database.engine)
+    if "videos" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("videos")}
+    migrations = [
+        ("visual_style", "VARCHAR DEFAULT 'realistic'"),
+        ("visual_provider", "VARCHAR"),
+        ("visual_generation_status", "JSON"),
+    ]
+    with database.engine.begin() as conn:
+        for col, typedef in migrations:
+            if col not in existing:
+                conn.execute(text(f"ALTER TABLE videos ADD COLUMN {col} {typedef}"))
+
+
+_migrate_schema()
 
 app = FastAPI(title="AI Video Automation API - Phase 5")
 
@@ -51,12 +79,14 @@ def health_check():
 def create_video(video: schemas.VideoCreate, db: Session = Depends(database.get_db)):
     # 1. Create initial draft video record
     try:
+        visual_style = (video.visual_style or "realistic").lower()
         db_video = models.Video(
             prompt=video.prompt,
             duration=video.duration,
             language=video.language,
             style=video.style,
             target_platform=video.target_platform,
+            visual_style=visual_style,
             owner_id=1,
             status=models.VideoStatus.DRAFT,
             generation_stage="NOT_STARTED",
@@ -76,7 +106,8 @@ def create_video(video: schemas.VideoCreate, db: Session = Depends(database.get_
             duration=video.duration,
             language=video.language,
             style=video.style,
-            target_platform=video.target_platform
+            target_platform=video.target_platform,
+            visual_style=visual_style,
         )
 
         plan_dict = plan.model_dump()
@@ -175,13 +206,27 @@ def run_qa_validation(video_id: int, db: Session) -> bool:
     has_title = bool(video.title or plan.get("title"))
     has_script = bool(video.script or plan.get("complete_narration"))
     has_scenes = bool(plan.get("scenes"))
+    scenes = plan.get("scenes", [])
+    scene_images_ok = all(
+        s.get("image_path") and os.path.exists(s.get("image_path", ""))
+        for s in scenes
+    ) if scenes else False
 
     qa_report["checks"]["has_title"] = has_title
     qa_report["checks"]["has_script"] = has_script
     qa_report["checks"]["has_scenes"] = has_scenes
+    qa_report["checks"]["scene_images_generated"] = scene_images_ok
 
     if not (has_title and has_script and has_scenes):
         qa_report["error"] = "Video metadata incomplete (missing title, script, or scenes)"
+        video.qa_report = qa_report
+        video.status = models.VideoStatus.FAILED
+        video.error_message = qa_report["error"]
+        db.commit()
+        return False
+
+    if scenes and not scene_images_ok:
+        qa_report["error"] = "One or more scene visual images are missing"
         video.qa_report = qa_report
         video.status = models.VideoStatus.FAILED
         video.error_message = qa_report["error"]
@@ -203,35 +248,100 @@ def run_qa_validation(video_id: int, db: Session) -> bool:
 # ---------------------------------------------------------------------- #
 # Background Pipeline Execution
 # ---------------------------------------------------------------------- #
+def _parse_resolution(resolution: str) -> tuple[int, int]:
+    try:
+        w, h = resolution.lower().split("x")
+        return int(w), int(h)
+    except Exception:
+        return 1080, 1920
+
+
+def _get_scene_durations(scenes: list) -> list:
+    """Extract duration per scene from structured or legacy fields."""
+    durations = []
+    for scene in scenes:
+        if scene.get("duration"):
+            durations.append(scene["duration"])
+        elif scene.get("scene_duration"):
+            durations.append(scene["scene_duration"])
+        else:
+            durations.append(5)
+    return durations
+
+
 def run_video_pipeline(video_id: int):
+    """
+    Full visual video pipeline:
+    Script/Plan (already done) -> Visual Prompts (in plan) ->
+    AI Image Generation -> Voiceover -> Subtitles -> FFmpeg Composition (with animation)
+    """
     db = database.SessionLocal()
     try:
         video = db.query(models.Video).filter(models.Video.id == video_id).first()
         if not video or not video.plan:
             return
 
-        # Record Generation Attempt
-        attempt_count = db.query(models.GenerationAttempt).filter(models.GenerationAttempt.video_id == video_id).count() + 1
+        attempt_count = db.query(models.GenerationAttempt).filter(
+            models.GenerationAttempt.video_id == video_id
+        ).count() + 1
         attempt = models.GenerationAttempt(
             video_id=video_id,
             attempt_number=attempt_count,
-            stage="VOICEOVER",
+            stage="VISUALS",
             status="STARTED",
             started_at=datetime.utcnow()
         )
         db.add(attempt)
-        
+
         video.status = models.VideoStatus.GENERATING
         video.error_message = None
         video.updated_at = datetime.utcnow()
         db.commit()
 
-        plan = video.plan
+        plan = dict(video.plan)
         base_dir = f"assets/video_{video_id}"
         os.makedirs(base_dir, exist_ok=True)
+        width, height = _parse_resolution(video.resolution or "1080x1920")
+        visual_style = video.visual_style or "realistic"
+        scenes = plan.get("scenes", [])
+
+        def _persist_visual_status(status: dict):
+            video.visual_generation_status = status
+            db.commit()
 
         try:
-            # 1. Voiceover
+            # 1. AI Image Generation for each scene
+            video.generation_stage = "VISUALS"
+            attempt.stage = "VISUALS"
+            video.visual_generation_status = init_visual_status(scenes)
+            db.commit()
+
+            image_paths, updated_scenes, visual_status = generate_scene_visuals(
+                video_id=video_id,
+                scenes=scenes,
+                base_dir=base_dir,
+                visual_style=visual_style,
+                db_session=db,
+                video_model=models.Video,
+                scene_asset_model=models.SceneAsset,
+                width=width,
+                height=height,
+                status_callback=_persist_visual_status,
+            )
+
+            plan["scenes"] = updated_scenes
+            video.plan = plan
+            video.visual_generation_status = visual_status
+            video.visual_provider = visual_status.get("provider")
+            db.commit()
+
+            if visual_status.get("fallback_used"):
+                print(
+                    f"[VisualGen] Warning: fallback to mock provider used. "
+                    f"Reason: {visual_status.get('fallback_reason')}"
+                )
+
+            # 2. Voiceover
             video.generation_stage = "VOICEOVER"
             attempt.stage = "VOICEOVER"
             db.commit()
@@ -241,7 +351,7 @@ def run_video_pipeline(video_id: int):
             video.audio_path = audio_path
             db.commit()
 
-            # 2. Subtitles
+            # 3. Subtitles
             video.generation_stage = "SUBTITLES"
             attempt.stage = "SUBTITLES"
             db.commit()
@@ -249,26 +359,14 @@ def run_video_pipeline(video_id: int):
             video.subtitles_path = srt_path
             db.commit()
 
-            # 3. Visuals
-            video.generation_stage = "VISUALS"
-            attempt.stage = "VISUALS"
-            db.commit()
-            image_paths = []
-            durations = []
-            scenes = plan.get("scenes", [])
-            for i, scene in enumerate(scenes):
-                img_path = os.path.join(base_dir, f"scene_{i}.jpg")
-                generate_mock_scene_image(scene.get("visual_description", f"Scene {i+1}"), img_path)
-                image_paths.append(img_path)
-                durations.append(scene.get("scene_duration", "4"))
-
-            # 4. Compose
+            # 4. Compose with scene animation + subtitle overlay
             video.generation_stage = "COMPOSING"
             attempt.stage = "COMPOSING"
             db.commit()
 
+            durations = _get_scene_durations(updated_scenes)
             final_mp4 = os.path.join(base_dir, "final.mp4")
-            compose_video(image_paths, durations, audio_path, srt_path, final_mp4)
+            compose_video(image_paths, durations, audio_path, srt_path, final_mp4, width, height)
             video.video_path = final_mp4
             video.video_url = f"/assets/video_{video_id}/final.mp4"
             video.status = models.VideoStatus.GENERATED
@@ -278,7 +376,7 @@ def run_video_pipeline(video_id: int):
             attempt.completed_at = datetime.utcnow()
             db.commit()
 
-            # 5. QA / Validation -> transitions to PENDING_APPROVAL
+            # 5. QA -> PENDING_APPROVAL
             run_qa_validation(video_id, db)
 
         except Exception as e:
@@ -507,6 +605,162 @@ def get_video(video_id: int, db: Session = Depends(database.get_db)):
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
     return video
+
+
+@app.get("/visual/provider-status", response_model=schemas.VisualProviderStatus)
+def get_visual_provider_status():
+    """Report which visual generation provider is active and hardware requirements."""
+    import os
+    provider_mode = os.getenv("VISUAL_PROVIDER", "auto")
+    model_id = os.getenv("VISUAL_MODEL", "stabilityai/sd-turbo")
+    replicate_model = os.getenv("REPLICATE_MODEL", "stability-ai/sdxl")
+
+    try:
+        active = get_visual_provider()
+        active_name = active.name
+        is_available = active.is_available
+        message = active.availability_message()
+    except Exception as exc:
+        active_name = "unavailable"
+        is_available = False
+        message = str(exc)
+
+    # Determine requirements based on provider
+    requires_gpu = False
+    recommended_vram_gb = 8
+    recommended_ram_gb = 8
+    
+    if "replicate" in active_name.lower():
+        requires_gpu = False  # Cloud-based
+        recommended_vram_gb = 0
+        recommended_ram_gb = 4
+    elif "local" in active_name.lower():
+        requires_gpu = True  # GPU recommended
+        recommended_vram_gb = 4
+        recommended_ram_gb = 8
+    elif "mock" in active_name.lower():
+        requires_gpu = False
+        recommended_vram_gb = 0
+        recommended_ram_gb = 2
+
+    return schemas.VisualProviderStatus(
+        provider=active_name,
+        is_available=is_available,
+        message=message,
+        model=replicate_model if "replicate" in active_name.lower() else model_id,
+        requires_gpu=requires_gpu,
+        recommended_vram_gb=recommended_vram_gb,
+        recommended_ram_gb=recommended_ram_gb,
+    )
+
+
+@app.get("/videos/{video_id}/scenes", response_model=List[schemas.SceneAssetResponse])
+def get_video_scene_assets(video_id: int, db: Session = Depends(database.get_db)):
+    """List all scene visual assets for a video."""
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    assets = (
+        db.query(models.SceneAsset)
+        .filter(models.SceneAsset.video_id == video_id)
+        .order_by(models.SceneAsset.scene_number.asc())
+        .all()
+    )
+
+    responses = []
+    for asset in assets:
+        data = schemas.SceneAssetResponse.model_validate(asset)
+        if asset.image_path:
+            data = data.model_copy(
+                update={"image_url": f"/assets/video_{video_id}/scene_{asset.scene_number:03d}.png"}
+            )
+        responses.append(data)
+    return responses
+
+
+@app.post("/videos/{video_id}/scenes/{scene_number}/regenerate")
+def regenerate_scene_visual(
+    video_id: int,
+    scene_number: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(database.get_db),
+    authorized: bool = Depends(verify_admin_auth),
+):
+    """Regenerate visual for a single scene without re-running the entire pipeline."""
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    plan = dict(video.plan or {})
+    scenes = plan.get("scenes", [])
+    scene = next((s for s in scenes if s.get("scene_number") == scene_number), None)
+    if not scene:
+        raise HTTPException(status_code=404, detail=f"Scene {scene_number} not found")
+
+    base_dir = f"assets/video_{video_id}"
+    width, height = _parse_resolution(video.resolution or "1080x1920")
+
+    # Update status
+    visual_status = dict(video.visual_generation_status or init_visual_status(scenes))
+    update_scene_status(visual_status, scene_number, "generating")
+    video.visual_generation_status = visual_status
+    db.commit()
+
+    def _regen_task():
+        regen_db = database.SessionLocal()
+        try:
+            vid = regen_db.query(models.Video).filter(models.Video.id == video_id).first()
+            if not vid:
+                return
+            current_plan = dict(vid.plan or {})
+            current_scenes = current_plan.get("scenes", [])
+            target = next((s for s in current_scenes if s.get("scene_number") == scene_number), None)
+            if not target:
+                return
+
+            updated_scene = regenerate_single_scene(
+                video_id=video_id,
+                scene_number=scene_number,
+                scene=target,
+                all_scenes=current_scenes,
+                base_dir=base_dir,
+                visual_style=vid.visual_style or "realistic",
+                db_session=regen_db,
+                scene_asset_model=models.SceneAsset,
+                width=width,
+                height=height,
+            )
+
+            for i, s in enumerate(current_scenes):
+                if s.get("scene_number") == scene_number:
+                    current_scenes[i] = updated_scene
+                    break
+            current_plan["scenes"] = current_scenes
+            vid.plan = current_plan
+
+            vstatus = dict(vid.visual_generation_status or init_visual_status(current_scenes))
+            update_scene_status(vstatus, scene_number, "completed")
+            vid.visual_generation_status = vstatus
+            vid.updated_at = datetime.utcnow()
+            regen_db.commit()
+        except Exception as exc:
+            vid = regen_db.query(models.Video).filter(models.Video.id == video_id).first()
+            if vid:
+                vstatus = dict(vid.visual_generation_status or {})
+                update_scene_status(vstatus, scene_number, "failed")
+                vid.visual_generation_status = vstatus
+                vid.error_message = f"Scene {scene_number} regeneration failed: {exc}"
+                regen_db.commit()
+        finally:
+            regen_db.close()
+
+    background_tasks.add_task(_regen_task)
+    return {
+        "status": "regenerating",
+        "video_id": video_id,
+        "scene_number": scene_number,
+    }
 
 
 @app.get("/videos/{video_id}/audit_log", response_model=schemas.AuditLogResponse)
@@ -917,5 +1171,4 @@ def validate_video_publishing_config(
         errors={},
         message=f"Success! All {validated_count} platform configuration(s) are validated. Video is Ready to Schedule!"
     )
-
 

@@ -91,6 +91,15 @@ def check_api_health():
 
 check_api_health()
 
+# Stable app state to avoid top-level session_state churn during reruns.
+def get_app_state():
+    if "app_state" not in st.session_state:
+        st.session_state["app_state"] = {
+            "created_video": None,
+            "gen_started_for": None,
+        }
+    return st.session_state["app_state"]
+
 # Helper to render status badge
 def render_status_badge(status_str: str) -> str:
     status_clean = (status_str or "DRAFT").upper()
@@ -129,6 +138,88 @@ def render_audit_log(vid: int):
                         st.caption("No generation attempts logged.")
     except Exception:
         pass
+
+
+def _status_icon(status: str) -> str:
+    status = (status or "pending").lower()
+    return {
+        "completed": "OK",
+        "generating": "...",
+        "failed": "FAIL",
+        "pending": "WAIT",
+    }.get(status, status.upper())
+
+
+def render_visual_generation_status(video):
+    status = video.get("visual_generation_status") or {}
+    scenes = status.get("scenes") or {}
+    provider = video.get("visual_provider") or status.get("provider") or "not selected"
+    total = status.get("total_scenes") or len(scenes)
+    current = status.get("current_scene") or 0
+
+    st.markdown("#### Visual Generation")
+    st.caption(f"Provider: `{provider}` | Visual style: `{video.get('visual_style') or 'realistic'}`")
+    if total:
+        if current:
+            st.write(f"Generating Scene {current}/{total}" if video.get("generation_stage") == "VISUALS" else f"{total} scene visual(s)")
+        cols = st.columns(min(max(total, 1), 5))
+        for idx, key in enumerate(sorted(scenes, key=lambda k: int(k) if str(k).isdigit() else 999)):
+            scene_status = scenes[key].get("status", "pending")
+            cols[idx % len(cols)].metric(f"Scene {key}", _status_icon(scene_status))
+    else:
+        st.caption("Scene visuals have not started yet.")
+
+    if status.get("fallback_used"):
+        st.warning(f"Local visual generation fell back to the development mock provider: {status.get('fallback_reason')}")
+
+
+def render_scene_visual_previews(video):
+    vid = video["id"]
+    plan = video.get("plan") or {}
+    scenes = plan.get("scenes", [])
+    if not scenes:
+        return
+
+    render_visual_generation_status(video)
+    st.markdown("#### Scene Visual Previews")
+    try:
+        res = requests.get(f"{API_URL}/videos/{vid}/scenes", timeout=3)
+        assets = res.json() if res.status_code == 200 else []
+    except Exception:
+        assets = []
+    assets_by_scene = {a.get("scene_number"): a for a in assets}
+
+    for scene in scenes:
+        scene_num = scene.get("scene_number")
+        asset = assets_by_scene.get(scene_num, {})
+        image_path = scene.get("image_path") or asset.get("image_path")
+        status = scene.get("visual_status") or asset.get("status") or "pending"
+
+        with st.expander(f"Scene {scene_num} - {_status_icon(status)}", expanded=bool(image_path)):
+            c_img, c_meta = st.columns([1, 2])
+            with c_img:
+                if image_path and os.path.exists(image_path):
+                    st.image(image_path, width="stretch")
+                    if scene.get("is_mock_visual") or asset.get("is_mock"):
+                        st.warning("Development mock visual. Configure the local provider for real AI images.")
+                else:
+                    st.info("No visual generated yet.")
+            with c_meta:
+                st.write(f"**Narration:** {scene.get('narration', '')}")
+                st.write(f"**Visual prompt:** {scene.get('visual_prompt') or scene.get('visual_description', '')}")
+                st.caption(f"Environment: {scene.get('environment', '')}")
+                st.caption(f"Characters: {scene.get('characters', '')}")
+                st.caption(f"Objects: {scene.get('objects', '')}")
+                if st.button("Regenerate Scene", key=f"regen_scene_{vid}_{scene_num}", disabled=not is_admin):
+                    regen = requests.post(
+                        f"{API_URL}/videos/{vid}/scenes/{scene_num}/regenerate",
+                        headers=admin_headers,
+                    )
+                    if regen.status_code == 200:
+                        st.success(f"Scene {scene_num} regeneration started.")
+                        st.rerun()
+                    else:
+                        st.error(f"Could not regenerate scene {scene_num}: {regen.text}")
 
 
 # ---------------------------------------------------------------------- #
@@ -295,7 +386,7 @@ def render_publishing_settings_widget(video):
 
         st.markdown("")
         if use_yt or use_ig or use_tt:
-            if st.button("💾 Save & Validate Configuration", key=f"btn_save_val_{vid}", type="primary", use_container_width=True):
+            if st.button("💾 Save & Validate Configuration", key=f"btn_save_val_{vid}", type="primary", width="stretch"):
                 if has_missing_account:
                     st.error("Cannot validate: One or more selected platforms are missing a connected account.")
                 else:
@@ -454,10 +545,15 @@ elif nav_selection == "Pending Approval":
                             if scenes:
                                 for s in scenes:
                                     with st.expander(f"Scene {s.get('scene_number', '?')} ({s.get('scene_duration', '')})"):
-                                        st.write(f"**Visual:** {s.get('visual_description', '')}")
+                                        st.write(f"**Visual:** {s.get('visual_prompt') or s.get('visual_description', '')}")
+                                        st.caption(f"Environment: {s.get('environment', '')}")
+                                        st.caption(f"Characters: {s.get('characters', '')}")
+                                        st.caption(f"Objects: {s.get('objects', '')}")
                                         st.write(f"**Narration:** {s.get('narration', '')}")
                             else:
                                 st.caption("No scene breakdown details.")
+
+                            render_scene_visual_previews(video)
 
                         st.divider()
 
@@ -470,7 +566,7 @@ elif nav_selection == "Pending Approval":
 
                         # Action 1: APPROVE
                         with btn_col1:
-                            if st.button("✅ APPROVE", key=f"btn_app_{vid}", type="primary", use_container_width=True):
+                            if st.button("✅ APPROVE", key=f"btn_app_{vid}", type="primary", width="stretch"):
                                 if not is_admin:
                                     st.error("Action denied: Admin authorization required.")
                                 else:
@@ -485,7 +581,7 @@ elif nav_selection == "Pending Approval":
 
                         # Action 2: REJECT (with optional reason)
                         with btn_col2:
-                            with st.popover("❌ REJECT", use_container_width=True):
+                            with st.popover("❌ REJECT", width="stretch"):
                                 st.markdown("### Reject Video")
                                 reject_reason = st.text_input("Rejection Reason (Optional)", placeholder="e.g. Visual pacing too fast, audio volume low", key=f"rej_input_{vid}")
                                 if st.button("Confirm Rejection", key=f"confirm_rej_{vid}", type="secondary"):
@@ -507,7 +603,7 @@ elif nav_selection == "Pending Approval":
 
                         # Action 3: REGENERATE
                         with btn_col3:
-                            if st.button("🔄 REGENERATE", key=f"btn_regen_{vid}", use_container_width=True):
+                            if st.button("🔄 REGENERATE", key=f"btn_regen_{vid}", width="stretch"):
                                 with st.spinner("Starting regeneration pipeline..."):
                                     regen_res = requests.post(f"{API_URL}/videos/{vid}/regenerate", headers=admin_headers)
                                     if regen_res.status_code == 200:
@@ -518,7 +614,7 @@ elif nav_selection == "Pending Approval":
 
                         # Action 4: EDIT CONTENT
                         with btn_col4:
-                            edit_expander = st.popover("✏️ EDIT CONTENT", use_container_width=True)
+                            edit_expander = st.popover("✏️ EDIT CONTENT", width="stretch")
                             with edit_expander:
                                 st.markdown("### Edit Video Content")
                                 st.caption("Edits update the working plan while keeping the original AI generation preserved.")
@@ -634,6 +730,8 @@ elif nav_selection == "My Videos / Projects":
                                     else:
                                         st.caption("No video file generated yet.")
 
+                                render_scene_visual_previews(v)
+
                                 # Phase 5: Publishing Settings on Approved and Ready to Schedule videos
                                 if v_status in ["APPROVED", "READY_TO_SCHEDULE"]:
                                     render_publishing_settings_widget(v)
@@ -692,11 +790,11 @@ elif nav_selection == "Create Video":
         with c2:
             language = st.selectbox("Language", ["English", "Spanish", "French", "German"], index=0)
             style = st.selectbox("Style/Tone", ["Educational", "Dramatic", "Humorous", "Corporate"], index=0)
+            visual_style = st.selectbox("Visual Style", ["realistic", "cinematic", "3d", "illustration", "anime", "minimal"], index=0)
 
         submitted = st.form_submit_button("Generate Plan & Script", type="primary")
 
-    if "created_video" not in st.session_state:
-        st.session_state["created_video"] = None
+    app_state = get_app_state()
 
     if submitted:
         if not prompt.strip():
@@ -709,12 +807,13 @@ elif nav_selection == "Create Video":
                         "duration": duration,
                         "language": language,
                         "style": style,
-                        "target_platform": target_platform
+                        "target_platform": target_platform,
+                        "visual_style": visual_style,
                     }
                     res = requests.post(f"{API_URL}/videos/", json=payload)
                     if res.status_code == 200:
-                        st.session_state["created_video"] = res.json()
-                        st.session_state["gen_started_for"] = None
+                        app_state["created_video"] = res.json()
+                        app_state["gen_started_for"] = None
                         st.rerun()
                     else:
                         st.error(f"Error: {res.text}")
@@ -722,8 +821,8 @@ elif nav_selection == "Create Video":
                     st.error(f"Connection failed to {API_URL}: {e}")
 
     # Render created video plan and Start Generation button OUTSIDE the submitted block
-    if st.session_state.get("created_video"):
-        data = st.session_state["created_video"]
+    if app_state.get("created_video"):
+        data = app_state["created_video"]
         vid = data["id"]
         plan = data.get("plan") or {}
 
@@ -744,22 +843,22 @@ elif nav_selection == "Create Video":
                 with st.expander(f"🎬 Scene Breakdown ({len(scenes)} scenes)"):
                     for s in scenes:
                         st.markdown(f"**Scene {s.get('scene_number', '?')}** ({s.get('scene_duration', '')}s):")
-                        st.caption(f"• Visual: {s.get('visual_description', '')}")
-                        st.caption(f"• Narration: {s.get('narration', '')}")
+                        st.caption(f"Visual: {s.get('visual_prompt') or s.get('visual_description', '')}")
+                        st.caption(f"Narration: {s.get('narration', '')}")
 
         with c_actions:
             st.markdown("### Next Steps")
             
-            if st.session_state.get("gen_started_for") == vid:
+            if app_state.get("gen_started_for") == vid:
                 st.info(f"⏳ **Video #{vid} is generating in the background!**\n\nThe pipeline is creating the TTS audio, generating subtitles, compiling visuals, and burning captions.")
                 st.success("👉 Go to **Pending Approval** in the sidebar to review the video once rendering completes.")
             else:
-                if st.button("🚀 Start Video Generation Now", key=f"start_gen_{vid}", type="primary", use_container_width=True):
+                if st.button("🚀 Start Video Generation Now", key=f"start_gen_{vid}", type="primary", width="stretch"):
                     with st.spinner("Initiating rendering pipeline..."):
                         try:
                             gen_res = requests.post(f"{API_URL}/videos/{vid}/generate")
                             if gen_res.status_code == 200:
-                                st.session_state["gen_started_for"] = vid
+                                app_state["gen_started_for"] = vid
                                 st.rerun()
                             else:
                                 st.error(f"Failed to start generation: {gen_res.text}")
@@ -767,9 +866,9 @@ elif nav_selection == "Create Video":
                             st.error(f"Error calling backend at {API_URL}: {e}")
 
             st.write("")
-            if st.button("Create Another Video", key="btn_create_another_vid", type="secondary", use_container_width=True):
-                st.session_state["created_video"] = None
-                st.session_state["gen_started_for"] = None
+            if st.button("Create Another Video", key="btn_create_another_vid", type="secondary", width="stretch"):
+                app_state["created_video"] = None
+                app_state["gen_started_for"] = None
                 st.rerun()
 
 
@@ -935,6 +1034,35 @@ elif nav_selection == "Settings":
     3. **Intelligent Fallback Generator**: Automatically used when API keys are unconfigured or rate-limited.
     """)
 
+    st.subheader("Visual Generation Provider")
+    try:
+        visual_res = requests.get(f"{API_URL}/visual/provider-status", timeout=3)
+        if visual_res.status_code == 200:
+            visual = visual_res.json()
+            st.write(f"**Active provider:** `{visual.get('provider')}`")
+            st.write(f"**Selected model:** `{visual.get('model')}`")
+            st.write(f"**Status:** {visual.get('message')}")
+            st.caption(
+                f"GPU required: {visual.get('requires_gpu')} | "
+                f"Recommended VRAM: {visual.get('recommended_vram_gb')} GB | "
+                f"Recommended RAM: {visual.get('recommended_ram_gb')} GB"
+            )
+        else:
+            st.warning(f"Visual provider status unavailable: {visual_res.text}")
+    except Exception as exc:
+        st.warning(f"Visual provider status unavailable: {exc}")
+
+    st.markdown("""
+    ```bash
+    # Real local AI images, free/open-source
+    VISUAL_PROVIDER=local
+    VISUAL_MODEL=stabilityai/sd-turbo
+
+    # Development fallback only; visibly watermarked as not AI-generated
+    VISUAL_PROVIDER=mock
+    ```
+    """)
+
     st.subheader("Official Social Media OAuth Credentials ($0-Cost)")
     st.markdown("""
     To configure official social media accounts, register free developer apps and add their client credentials to `.env`:
@@ -956,4 +1084,3 @@ elif nav_selection == "Settings":
     ENCRYPTION_KEY=your-fernet-encryption-key
     ```
     """)
-

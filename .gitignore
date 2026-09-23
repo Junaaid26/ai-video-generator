@@ -1,5 +1,29 @@
-.env
 venv/
+venv_clean/
+.venv/
+
 __pycache__/
-*.pyc
+*.py[cod]
+
+.env
+.env.*
+
+.vscode/
+.idea/
+
+.streamlit/secrets.toml
+
 .DS_Store
+Thumbs.db
+
+*.tmp
+*.log
+
+# Generated video assets
+assets/
+
+# Local databases
+*.db
+
+# Generated test files
+test_generation.png
