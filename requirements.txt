@@ -14,3 +14,8 @@ torch
 torchaudio
 imageio_ffmpeg
 httpx
+diffusers
+transformers
+accelerate
+safetensors
+requests

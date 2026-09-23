@@ -18,9 +18,20 @@ class UserResponse(UserBase):
 
 class Scene(BaseModel):
     scene_number: int
-    scene_duration: str
+    duration: Optional[int] = None  # seconds (preferred)
+    scene_duration: Optional[str] = None  # legacy e.g. "5s"
     narration: str
-    visual_description: str
+    visual_prompt: str = ""
+    environment: str = ""
+    characters: str = ""
+    objects: str = ""
+    camera_style: str = ""
+    visual_style: str = "realistic"
+    visual_description: Optional[str] = None  # legacy alias
+    image_path: Optional[str] = None
+    image_url: Optional[str] = None
+    visual_status: Optional[str] = None  # pending, generating, completed, failed
+    is_mock_visual: Optional[bool] = None
 
 class VideoPlan(BaseModel):
     title: str
@@ -39,6 +50,7 @@ class VideoCreate(VideoBase):
     language: Optional[str] = "English"
     style: Optional[str] = "Standard"
     target_platform: Optional[str] = "TikTok"
+    visual_style: Optional[str] = "realistic"  # realistic, cinematic, 3d, illustration, anime, minimal
 
 class VideoUpdate(BaseModel):
     title: Optional[str] = None
@@ -73,6 +85,9 @@ class VideoResponse(VideoBase):
     error_message: Optional[str] = None
     generation_stage: Optional[str] = None
     resolution: Optional[str] = "1080x1920"
+    visual_style: Optional[str] = "realistic"
+    visual_provider: Optional[str] = None
+    visual_generation_status: Optional[Dict[str, Any]] = None
     qa_report: Optional[Dict[str, Any]] = None
     rejection_reason: Optional[str] = None
     created_at: datetime
@@ -112,6 +127,34 @@ class AuditLogResponse(BaseModel):
     video_id: int
     approvals: List[ApprovalResponse]
     generation_attempts: List[GenerationAttemptResponse]
+
+
+class SceneAssetResponse(BaseModel):
+    id: int
+    video_id: int
+    scene_number: int
+    image_path: Optional[str] = None
+    image_url: Optional[str] = None
+    visual_prompt: Optional[str] = None
+    status: str
+    provider: Optional[str] = None
+    is_mock: bool = False
+    error_message: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class VisualProviderStatus(BaseModel):
+    provider: str
+    is_available: bool
+    message: str
+    model: Optional[str] = None
+    requires_gpu: bool = False
+    recommended_vram_gb: Optional[int] = None
+    recommended_ram_gb: Optional[int] = None
 
 
 # ---------------------------------------------------------------------- #
