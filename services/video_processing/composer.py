@@ -158,27 +158,32 @@ def _burn_subtitles(
     # videos. Scale the font size to the real video height instead, and use
     # a small bottom margin so subtitles sit in a single line near the
     # bottom of the frame.
-    font_size = max(14, round(height * 0.032))
-    margin_v = max(40, round(height * 0.04))
+    # Scale font size, vertical margin, and horizontal margins relative to target resolution
+    font_size = max(18, round(height * 0.029))  # 56px for 1920h
+    margin_v = max(60, round(height * 0.135))   # 260px for 1920h (~13.5% above bottom edge)
+    margin_h = max(30, round(width * 0.083))    # 90px for 1080w (safe left/right margins)
 
-    # ASS-style force_style for readable bottom subtitles
+    # Explicit PlayResX and PlayResY tell libass the exact pixel canvas resolution
     subtitle_style = (
+        f"PlayResX={width},"
+        f"PlayResY={height},"
         "FontName=Arial,"
         f"FontSize={font_size},"
-        "PrimaryColour=&H00FFFFFF,"
-        "OutlineColour=&H00000000,"
-        "BackColour=&H80000000,"
-        "BorderStyle=1,"
-        "Outline=2,"
-        "Shadow=0,"
-        f"MarginV={margin_v},"
-        "Alignment=2,"
-        "Bold=0"
+        "PrimaryColour=&H00FFFFFF,"   # White text
+        "OutlineColour=&H00000000,"   # Black outline
+        "BackColour=&H60000000,"      # Subtle dark backing
+        "BorderStyle=1,"              # Outline + shadow
+        "Outline=3,"                  # 3px crisp black outline/stroke
+        "Shadow=1,"                   # Subtle shadow for legibility over bright backgrounds
+        f"MarginV={margin_v},"        # ~13.5% above bottom edge
+        f"MarginL={margin_h},"        # Safe left margin
+        f"MarginR={margin_h},"        # Safe right margin
+        "Alignment=2,"                # Centered horizontally
+        "Bold=1"                      # Bold sans-serif font
     )
 
     subtitle_filter = (
-        f"subtitles={local_srt_name}:original_size={width}x{height}"
-        f":force_style='{subtitle_style}'"
+        f"subtitles={local_srt_name}:force_style='{subtitle_style}'"
     )
 
     video_name = os.path.basename(video_path)

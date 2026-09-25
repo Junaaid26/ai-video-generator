@@ -1,9 +1,11 @@
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Header, Query, Request
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 import os
 import json
+import time
+import secrets
 from datetime import datetime
 
 from . import models, schemas, database
@@ -12,6 +14,7 @@ from services.tts.generator import generate_voiceover
 from services.subtitles.transcriber import generate_subtitles
 from services.video_processing.composer import compose_video
 from services.visual_generation import VisualGenerationService, get_visual_provider
+from services.visual_generation.base import validate_generated_image
 from services.visual_generation.pipeline_helpers import (
     generate_scene_visuals,
     regenerate_single_scene,
@@ -31,16 +34,39 @@ def _migrate_schema():
     inspector = inspect(database.engine)
     if "videos" not in inspector.get_table_names():
         return
+
+    # Migrate videos table
     existing = {c["name"] for c in inspector.get_columns("videos")}
-    migrations = [
+    video_migrations = [
         ("visual_style", "VARCHAR DEFAULT 'realistic'"),
         ("visual_provider", "VARCHAR"),
         ("visual_generation_status", "JSON"),
+        ("selected_platforms", "JSON"),
     ]
     with database.engine.begin() as conn:
-        for col, typedef in migrations:
+        for col, typedef in video_migrations:
             if col not in existing:
                 conn.execute(text(f"ALTER TABLE videos ADD COLUMN {col} {typedef}"))
+
+    # Create video_publications table if it doesn't exist
+    if "video_publications" not in inspector.get_table_names():
+        with database.engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS video_publications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id INTEGER NOT NULL REFERENCES videos(id),
+                    platform VARCHAR NOT NULL,
+                    social_account_id INTEGER REFERENCES social_accounts(id),
+                    status VARCHAR NOT NULL DEFAULT 'QUEUED',
+                    platform_post_id VARCHAR,
+                    post_url VARCHAR,
+                    error_message TEXT,
+                    attempt_count INTEGER DEFAULT 0,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    published_at DATETIME,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
 
 
 _migrate_schema()
@@ -181,7 +207,7 @@ def run_qa_validation(video_id: int, db: Session) -> bool:
 
     # Check 2: Playability & Duration
     try:
-        from moviepy import VideoFileClip
+        from moviepy.editor import VideoFileClip
         clip = VideoFileClip(video_path)
         duration = clip.duration
         resolution = f"{clip.size[0]}x{clip.size[1]}"
@@ -208,7 +234,7 @@ def run_qa_validation(video_id: int, db: Session) -> bool:
     has_scenes = bool(plan.get("scenes"))
     scenes = plan.get("scenes", [])
     scene_images_ok = all(
-        s.get("image_path") and os.path.exists(s.get("image_path", ""))
+        s.get("image_path") and validate_generated_image(s.get("image_path", ""))[0]
         for s in scenes
     ) if scenes else False
 
@@ -458,6 +484,318 @@ def approve_video(
     db.refresh(video)
 
     return video
+
+
+# ---------------------------------------------------------------------- #
+# Phase 5: Approve & Publish — Explicit user action
+# ---------------------------------------------------------------------- #
+def _do_publish_platform(
+    platform: str,
+    video: "models.Video",
+    pub_record: "models.VideoPublication",
+    db: Session,
+    use_sandbox: bool = False,
+    youtube_privacy: str = "public",
+    tiktok_privacy: str = "PUBLIC_TO_EVERYONE",
+):
+    """
+    Internal helper: publishes a single platform using the appropriate provider.
+    Updates pub_record in-place. Never surfaces raw tokens in errors or logs.
+    """
+    pub_record.status = models.PublicationStatus.PUBLISHING
+    pub_record.attempt_count = (pub_record.attempt_count or 0) + 1
+    db.commit()
+
+    video_path = video.video_path
+    if not video_path or not os.path.exists(video_path):
+        pub_record.status = models.PublicationStatus.FAILED
+        pub_record.error_message = "Video file not found on disk."
+        pub_record.updated_at = datetime.utcnow()
+        db.commit()
+        return
+
+    account = db.query(models.SocialAccount).filter(
+        models.SocialAccount.id == pub_record.social_account_id
+    ).first()
+
+    if not account or not account.encrypted_access_token:
+        pub_record.status = models.PublicationStatus.FAILED
+        pub_record.error_message = f"No active {platform} account connected. Please connect an account first."
+        pub_record.updated_at = datetime.utcnow()
+        db.commit()
+        return
+
+    if account.status != "ACTIVE":
+        pub_record.status = models.PublicationStatus.FAILED
+        pub_record.error_message = f"{platform} account '{account.account_name}' status is {account.status}. Please reconnect."
+        pub_record.updated_at = datetime.utcnow()
+        db.commit()
+        return
+
+    try:
+        access_token = decrypt_token(account.encrypted_access_token)
+    except Exception:
+        pub_record.status = models.PublicationStatus.FAILED
+        pub_record.error_message = f"Failed to read stored {platform} credentials. Please reconnect the account."
+        pub_record.updated_at = datetime.utcnow()
+        db.commit()
+        return
+
+    plan = video.plan or {}
+    base_title = (video.title or plan.get("title") or f"Video #{video.id}")[:100]
+    base_caption = video.caption or plan.get("caption") or ""
+    base_narration = video.script or plan.get("complete_narration") or ""
+    base_tags = video.hashtags or plan.get("hashtags") or []
+    tags_list = base_tags if isinstance(base_tags, list) else []
+
+    if platform == "youtube":
+        tags_clean = [t.lstrip("#") for t in tags_list]
+        desc = f"{base_caption}\n\n{' '.join(tags_list)}\n\n{base_narration}".strip()[:5000]
+        metadata = {"title": base_title, "description": desc, "privacy": youtube_privacy, "tags": tags_clean}
+    elif platform == "instagram":
+        hashtag_str = " ".join(tags_list)
+        caption = f"{base_caption}\n\n{hashtag_str}".strip()[:2200]
+        metadata = {"caption": caption, "hashtags": tags_list, "share_to_feed": True, "account_id": account.account_id}
+    elif platform == "tiktok":
+        hashtag_str = " ".join(tags_list)
+        tt_caption = f"{base_caption} {hashtag_str}".strip()[:2200]
+        metadata = {"caption": tt_caption, "privacy": tiktok_privacy, "allow_comments": True, "allow_duet": True, "allow_stitch": True}
+    else:
+        pub_record.status = models.PublicationStatus.FAILED
+        pub_record.error_message = f"Unknown platform: {platform}"
+        pub_record.updated_at = datetime.utcnow()
+        db.commit()
+        return
+
+    try:
+        provider = SocialProviderRegistry.get_provider(platform, use_sandbox=use_sandbox)
+        result = provider.publish_video(access_token=access_token, video_path=video_path, metadata=metadata)
+        if result.get("success"):
+            pub_record.status = models.PublicationStatus.PUBLISHED
+            pub_record.platform_post_id = result.get("external_post_id")
+            pub_record.post_url = result.get("post_url")
+            pub_record.error_message = None
+            pub_record.published_at = datetime.utcnow()
+        else:
+            pub_record.status = models.PublicationStatus.FAILED
+            raw_err = result.get("error") or "Unknown publishing error."
+            pub_record.error_message = raw_err[:1000]
+    except Exception as exc:
+        pub_record.status = models.PublicationStatus.FAILED
+        pub_record.error_message = f"Publishing exception: {str(exc)[:500]}"
+
+    pub_record.updated_at = datetime.utcnow()
+    db.commit()
+
+
+@app.post("/videos/{video_id}/approve-and-publish", response_model=schemas.ApproveAndPublishResponse)
+def approve_and_publish_video(
+    video_id: int,
+    payload: schemas.ApproveAndPublishRequest,
+    db: Session = Depends(database.get_db),
+    authorized: bool = Depends(verify_admin_auth)
+):
+    """
+    Phase 5 Approve & Publish:
+    1. Validates the video (same checks as /approve).
+    2. Records approval in the approvals table.
+    3. Transitions video to APPROVED.
+    4. For each selected platform, finds the connected account and creates a VideoPublication record.
+    5. Publishes to each platform independently — one failure does NOT block others.
+    6. Returns per-platform status (PUBLISHED, FAILED, NOT_SELECTED).
+
+    RULES:
+    - Never publishes before approval.
+    - Never publishes to a platform that was not selected.
+    - use_sandbox=true uses the mock provider for safe zero-credential testing.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if video.status not in [models.VideoStatus.PENDING_APPROVAL]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot approve: video is in '{video.status}' status. Must be PENDING_APPROVAL."
+        )
+
+    if not video.video_path or not os.path.exists(video.video_path):
+        raise HTTPException(status_code=400, detail="Cannot approve: Video file does not exist on disk.")
+    if os.path.getsize(video.video_path) < 1000:
+        raise HTTPException(status_code=400, detail="Cannot approve: Video file is empty or corrupted.")
+
+    plan = video.plan or {}
+    if not (video.title or plan.get("title")):
+        raise HTTPException(status_code=400, detail="Cannot approve: Title metadata is missing.")
+    if not (video.script or plan.get("complete_narration")):
+        raise HTTPException(status_code=400, detail="Cannot approve: Script metadata is missing.")
+
+    selected = [p.lower().strip() for p in payload.selected_platforms if p.strip()]
+    supported = ["youtube", "instagram", "tiktok"]
+    invalid = [p for p in selected if p not in supported]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unsupported platforms: {invalid}. Must be one of {supported}.")
+    if not selected:
+        raise HTTPException(status_code=400, detail="At least one platform must be selected.")
+
+    # === Step 1: Record approval ===
+    approval = models.Approval(
+        video_id=video.id,
+        reviewer_id=1,
+        action="APPROVED",
+        is_approved=True,
+        comments=f"Approved & publishing to: {', '.join(selected)}",
+        reviewed_at=datetime.utcnow()
+    )
+    db.add(approval)
+    video.status = models.VideoStatus.APPROVED
+    video.selected_platforms = selected
+    video.rejection_reason = None
+    video.updated_at = datetime.utcnow()
+    db.commit()
+
+    # === Step 2: Create VideoPublication records ===
+    pub_records: List[models.VideoPublication] = []
+    all_platforms = ["youtube", "instagram", "tiktok"]
+
+    for platform in all_platforms:
+        if platform not in selected:
+            pub = models.VideoPublication(
+                video_id=video.id, platform=platform,
+                social_account_id=None, status=models.PublicationStatus.NOT_SELECTED, attempt_count=0,
+            )
+            db.add(pub)
+            pub_records.append(pub)
+        else:
+            # Find connected account: prefer real account, fall back to sandbox
+            acct_q = db.query(models.SocialAccount).filter(
+                models.SocialAccount.platform == platform,
+                models.SocialAccount.status == "ACTIVE"
+            )
+            if payload.use_sandbox:
+                connected_account = acct_q.filter(models.SocialAccount.is_mock == True).first()
+            else:
+                connected_account = acct_q.filter(models.SocialAccount.is_mock == False).first()
+                if not connected_account:
+                    connected_account = acct_q.first()  # fallback to sandbox
+
+            if connected_account:
+                pub = models.VideoPublication(
+                    video_id=video.id, platform=platform,
+                    social_account_id=connected_account.id,
+                    status=models.PublicationStatus.QUEUED, attempt_count=0,
+                )
+            else:
+                pub = models.VideoPublication(
+                    video_id=video.id, platform=platform, social_account_id=None,
+                    status=models.PublicationStatus.FAILED,
+                    error_message=f"No active {platform} account found. Connect an account in Social Accounts.",
+                    attempt_count=0,
+                )
+            db.add(pub)
+            pub_records.append(pub)
+
+    db.commit()
+    for pub in pub_records:
+        db.refresh(pub)
+
+    # === Step 3: Publish to each QUEUED platform independently ===
+    for pub in pub_records:
+        if pub.status == models.PublicationStatus.QUEUED:
+            _do_publish_platform(
+                platform=pub.platform, video=video, pub_record=pub, db=db,
+                use_sandbox=payload.use_sandbox,
+                youtube_privacy=payload.youtube_privacy,
+                tiktok_privacy=payload.tiktok_privacy,
+            )
+
+    # === Step 4: Build summary & update video status ===
+    db.refresh(video)
+    for pub in pub_records:
+        db.refresh(pub)
+
+    summary = {pub.platform: pub.status.value for pub in pub_records}
+    published_count = sum(1 for pub in pub_records if pub.status == models.PublicationStatus.PUBLISHED)
+    if published_count > 0:
+        video.status = models.VideoStatus.PUBLISHED
+        video.updated_at = datetime.utcnow()
+        db.commit()
+
+    pub_summaries = [p for p in selected if summary.get(p) == "PUBLISHED"]
+    fail_summaries = [p for p in selected if summary.get(p) == "FAILED"]
+    msg_parts = []
+    if pub_summaries:
+        msg_parts.append(f"Published to: {', '.join(pub_summaries)}")
+    if fail_summaries:
+        msg_parts.append(f"Failed on: {', '.join(fail_summaries)}")
+    message = " | ".join(msg_parts) or "No platforms were published."
+
+    return schemas.ApproveAndPublishResponse(
+        video_id=video.id,
+        video_status=video.status.value,
+        selected_platforms=selected,
+        publications=[schemas.VideoPublicationResponse.model_validate(p) for p in pub_records],
+        summary=summary,
+        message=message,
+    )
+
+
+@app.get("/videos/{video_id}/publications", response_model=List[schemas.VideoPublicationResponse])
+def get_video_publications(
+    video_id: int,
+    db: Session = Depends(database.get_db)
+):
+    """Returns per-platform publication records for a video (PUBLISHED, FAILED, NOT_SELECTED)."""
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    pubs = db.query(models.VideoPublication).filter(
+        models.VideoPublication.video_id == video_id
+    ).order_by(models.VideoPublication.id.asc()).all()
+    return pubs
+
+
+@app.post("/videos/{video_id}/publications/{platform}/retry", response_model=schemas.VideoPublicationResponse)
+def retry_platform_publication(
+    video_id: int,
+    platform: str,
+    db: Session = Depends(database.get_db),
+    authorized: bool = Depends(verify_admin_auth),
+    use_sandbox: bool = False,
+):
+    """
+    Retry publishing to a single FAILED platform.
+    - Does NOT regenerate the video.
+    - Does NOT republish PUBLISHED platforms.
+    """
+    video = db.query(models.Video).filter(models.Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    pub = db.query(models.VideoPublication).filter(
+        models.VideoPublication.video_id == video_id,
+        models.VideoPublication.platform == platform.lower().strip()
+    ).order_by(models.VideoPublication.id.desc()).first()
+
+    if not pub:
+        raise HTTPException(status_code=404, detail=f"No publication record for platform '{platform}' on video #{video_id}.")
+    if pub.status == models.PublicationStatus.NOT_SELECTED:
+        raise HTTPException(status_code=400, detail=f"Platform '{platform}' was not selected for this video.")
+    if pub.status == models.PublicationStatus.PUBLISHED:
+        raise HTTPException(status_code=400, detail=f"Platform '{platform}' is already PUBLISHED.")
+
+    if not pub.social_account_id:
+        acct = db.query(models.SocialAccount).filter(
+            models.SocialAccount.platform == platform.lower(),
+            models.SocialAccount.status == "ACTIVE"
+        ).first()
+        if acct:
+            pub.social_account_id = acct.id
+            db.commit()
+
+    _do_publish_platform(platform=pub.platform, video=video, pub_record=pub, db=db, use_sandbox=use_sandbox)
+    db.refresh(pub)
+    return pub
 
 
 @app.post("/videos/{video_id}/reject", response_model=schemas.VideoResponse)
@@ -792,6 +1130,19 @@ def get_supported_social_platforms():
     return SocialProviderRegistry.list_all_platforms()
 
 
+# In-memory temporary store for TikTok PKCE verifiers:
+# {state: {"verifier": code_verifier, "created_at": timestamp}}
+# One-time use: popped immediately upon retrieval.
+_TIKTOK_PKCE_STORE: Dict[str, Dict[str, Any]] = {}
+
+
+def _cleanup_expired_pkce_verifiers(ttl_seconds: int = 900) -> None:
+    now = time.time()
+    expired = [s for s, data in _TIKTOK_PKCE_STORE.items() if now - data.get("created_at", 0) > ttl_seconds]
+    for s in expired:
+        _TIKTOK_PKCE_STORE.pop(s, None)
+
+
 @app.get("/social/oauth/authorize/{platform}")
 def get_social_oauth_authorization_url(
     platform: str,
@@ -803,9 +1154,20 @@ def get_social_oauth_authorization_url(
     """
     try:
         provider = SocialProviderRegistry.get_provider(platform, use_sandbox=sandbox)
-        import secrets
         csrf_state = secrets.token_urlsafe(16)
-        auth_url = provider.get_authorization_url(state=csrf_state, redirect_uri=redirect_uri)
+
+        if platform.lower() == "tiktok" and not sandbox:
+            from social.tiktok import generate_pkce_verifier
+            _cleanup_expired_pkce_verifiers()
+            code_verifier = generate_pkce_verifier()
+            _TIKTOK_PKCE_STORE[csrf_state] = {
+                "verifier": code_verifier,
+                "created_at": time.time()
+            }
+            auth_url = provider.get_authorization_url(state=csrf_state, redirect_uri=redirect_uri, code_verifier=code_verifier)
+        else:
+            auth_url = provider.get_authorization_url(state=csrf_state, redirect_uri=redirect_uri)
+
         return {"authorization_url": auth_url, "state": csrf_state, "platform": platform, "is_sandbox": sandbox}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -813,9 +1175,12 @@ def get_social_oauth_authorization_url(
 
 @app.get("/social/oauth/callback/{platform}")
 def handle_social_oauth_callback(
+    request: Request,
     platform: str,
-    code: str = Query(..., description="Authorization code from OAuth provider"),
-    redirect_uri: str = Query(..., description="Redirect URI used in authorization"),
+    code: Optional[str] = Query(None, description="Authorization code from OAuth provider"),
+    error: Optional[str] = Query(None, description="Error code from OAuth provider"),
+    error_description: Optional[str] = Query(None, description="Error description from OAuth provider"),
+    redirect_uri: Optional[str] = Query(None, description="Redirect URI used in authorization (optional — derived from request URL if absent)"),
     state: Optional[str] = Query(None),
     sandbox: bool = Query(False),
     db: Session = Depends(database.get_db)
@@ -823,10 +1188,49 @@ def handle_social_oauth_callback(
     """
     Exchanges OAuth code for access/refresh tokens, gets channel/profile info,
     encrypts credentials, and persists to social_accounts table.
+
+    redirect_uri is optional: Google's real OAuth callback does NOT echo it back
+    as a query parameter. When absent, it is derived from the request's own URL
+    (scheme + host + path, without query string) — which is exactly the registered
+    redirect URI that was used during the authorize step.
     """
+    # 1. Handle error response from OAuth provider
+    if error:
+        err_msg = f"OAuth provider error: {error}"
+        if error_description:
+            err_msg += f" - {error_description}"
+        raise HTTPException(status_code=400, detail=err_msg)
+
+    if not code:
+        raise HTTPException(status_code=400, detail="Missing authorization code from OAuth provider.")
+
+    # 2. Derive the redirect_uri from this request's own URL when not explicitly provided
+    if not redirect_uri:
+        redirect_uri = str(request.url).split("?")[0]
+
+    # 3. Validate PKCE requirements for TikTok
+    code_verifier = None
+    if platform.lower() == "tiktok" and not sandbox:
+        if not state:
+            raise HTTPException(status_code=400, detail="Missing required OAuth state parameter for TikTok callback.")
+        entry = _TIKTOK_PKCE_STORE.pop(state, None)
+        if not entry or not entry.get("verifier"):
+            raise HTTPException(status_code=400, detail="Missing or expired PKCE code_verifier for TikTok OAuth state.")
+        code_verifier = entry["verifier"]
+
     try:
         provider = SocialProviderRegistry.get_provider(platform, use_sandbox=sandbox)
-        token_data = provider.exchange_code_for_tokens(code=code, redirect_uri=redirect_uri)
+        if platform.lower() == "tiktok" and not sandbox:
+            token_data = provider.exchange_code_for_tokens(
+                code=code,
+                redirect_uri=redirect_uri,
+                code_verifier=code_verifier
+            )
+        else:
+            token_data = provider.exchange_code_for_tokens(
+                code=code,
+                redirect_uri=redirect_uri
+            )
         access_token = token_data.get("access_token")
         refresh_token = token_data.get("refresh_token")
         expires_in = token_data.get("expires_in")

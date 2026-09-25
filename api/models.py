@@ -4,6 +4,15 @@ from datetime import datetime
 import enum
 from .database import Base
 
+
+class PublicationStatus(str, enum.Enum):
+    NOT_SELECTED = "NOT_SELECTED"
+    QUEUED = "QUEUED"
+    PUBLISHING = "PUBLISHING"
+    PUBLISHED = "PUBLISHED"
+    FAILED = "FAILED"
+
+
 class VideoStatus(str, enum.Enum):
     DRAFT = "DRAFT"
     GENERATING = "GENERATING"
@@ -67,6 +76,9 @@ class Video(Base):
     rejection_reason = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
     
+    # Social publishing: which platforms were selected at approval time
+    selected_platforms = Column(JSON, nullable=True)  # e.g. ["instagram", "tiktok"]
+
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -79,6 +91,7 @@ class Video(Base):
     scene_assets = relationship("SceneAsset", back_populates="video", cascade="all, delete-orphan")
     scheduled_posts = relationship("ScheduledPost", back_populates="video", cascade="all, delete-orphan")
     publishing_configurations = relationship("PublishingConfiguration", back_populates="video", cascade="all, delete-orphan")
+    publications = relationship("VideoPublication", back_populates="video", cascade="all, delete-orphan")
 
 
 class SceneAsset(Base):
@@ -206,3 +219,30 @@ class ScheduledPost(Base):
     video = relationship("Video", back_populates="scheduled_posts")
     account = relationship("SocialAccount", back_populates="scheduled_posts", foreign_keys=[connected_account_id])
 
+
+class VideoPublication(Base):
+    """
+    Per-platform publishing record created at approval time.
+    Tracks the status of each selected platform independently.
+    One row per (video, platform) pair.
+    """
+    __tablename__ = "video_publications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    video_id = Column(Integer, ForeignKey("videos.id"), index=True, nullable=False)
+    platform = Column(String, nullable=False, index=True)  # youtube, instagram, tiktok
+    social_account_id = Column(Integer, ForeignKey("social_accounts.id"), nullable=True)
+    status = Column(
+        Enum(PublicationStatus, values_callable=lambda obj: [e.value for e in obj]),
+        default=PublicationStatus.QUEUED
+    )
+    platform_post_id = Column(String, nullable=True)    # External post/video ID returned by platform
+    post_url = Column(String, nullable=True)             # Public URL of the post
+    error_message = Column(Text, nullable=True)          # Safe error detail (no tokens)
+    attempt_count = Column(Integer, default=0)           # Track retry attempts
+    created_at = Column(DateTime, default=datetime.utcnow)
+    published_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    video = relationship("Video", back_populates="publications")
+    social_account = relationship("SocialAccount")

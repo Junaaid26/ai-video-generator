@@ -3,8 +3,9 @@
 import os
 from typing import Optional
 from dotenv import load_dotenv
+from PIL import Image, ImageOps
 
-from .base import VisualGenerationProvider, VisualGenerationRequest, VisualGenerationResult
+from .base import VisualGenerationProvider, VisualGenerationRequest, VisualGenerationResult, validate_generated_image
 from .prompt_builder import NEGATIVE_PROMPT, build_image_prompt
 
 # Load environment variables
@@ -149,9 +150,9 @@ class LocalImageGenerator(VisualGenerationProvider):
                     42 + request.scene_number
                 )
 
-            # SD-Turbo works best at 512x512 or 768x768; upscale after generation
-            gen_width = min(768, request.width)
-            gen_height = min(1344, request.height)
+            # Generate at 9:16 vertical resolution
+            gen_width = 576
+            gen_height = 1024
 
             result = pipe(
                 prompt=prompt,
@@ -165,12 +166,22 @@ class LocalImageGenerator(VisualGenerationProvider):
 
             image = result.images[0]
 
-            if (gen_width, gen_height) != (request.width, request.height):
-                from PIL import Image
-
-                image = image.resize((request.width, request.height), Image.LANCZOS)
+            if image.size != (request.width, request.height):
+                image = ImageOps.fit(image, (request.width, request.height), method=Image.LANCZOS)
 
             image.save(request.output_path, format="PNG", optimize=True)
+
+            is_valid, val_err = validate_generated_image(
+                request.output_path, target_width=request.width, target_height=request.height
+            )
+            if not is_valid:
+                return VisualGenerationResult(
+                    success=False,
+                    output_path=request.output_path,
+                    provider_name=self.name,
+                    is_mock=False,
+                    error_message=f"Local image validation failed: {val_err}",
+                )
 
             return VisualGenerationResult(
                 success=True,
@@ -182,6 +193,7 @@ class LocalImageGenerator(VisualGenerationProvider):
                     "model": _get_model_id(),
                     "device": device,
                     "steps": num_steps,
+                    "aspect_ratio": "9:16",
                 },
             )
 

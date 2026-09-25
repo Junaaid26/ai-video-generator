@@ -1,8 +1,10 @@
 import os
 import shutil
+import textwrap
 import whisper
 from whisper.utils import get_writer
 import imageio_ffmpeg
+
 
 def _ensure_ffmpeg_in_path():
     """Ensure ffmpeg executable from imageio_ffmpeg is in PATH for whisper."""
@@ -17,10 +19,19 @@ def _ensure_ffmpeg_in_path():
     except Exception as e:
         print(f"[FFmpeg PATH Warning]: {e}")
 
+
+def _wrap_text_lines(text: str, max_width: int = 32, max_lines: int = 2) -> str:
+    """Wrap text to max 32 characters per line, max 2 lines for clean subtitle blocks."""
+    lines = textwrap.wrap(text, width=max_width)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+    return "\n".join(lines)
+
+
 def _create_fallback_srt(audio_path: str, srt_path: str, fallback_text: str = "Audio narration"):
     """Creates a basic SRT file if Whisper transcription fails."""
     try:
-        from moviepy import AudioFileClip
+        from moviepy.editor import AudioFileClip
         audio = AudioFileClip(audio_path)
         duration = int(audio.duration) + 1
     except Exception:
@@ -30,9 +41,11 @@ def _create_fallback_srt(audio_path: str, srt_path: str, fallback_text: str = "A
     h, m = divmod(m, 60)
     end_time_str = f"{h:02d}:{m:02d}:{s:02d},000"
 
-    srt_content = f"1\n00:00:00,000 --> {end_time_str}\n{fallback_text}\n"
+    wrapped_text = _wrap_text_lines(fallback_text, max_width=32, max_lines=2)
+    srt_content = f"1\n00:00:00,000 --> {end_time_str}\n{wrapped_text}\n"
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write(srt_content)
+
 
 def generate_subtitles(audio_path: str, output_dir: str, filename_no_ext: str, fallback_text: str = "") -> str:
     """
@@ -49,9 +62,9 @@ def generate_subtitles(audio_path: str, output_dir: str, filename_no_ext: str, f
         model = whisper.load_model("base")
         result = model.transcribe(audio_path, word_timestamps=True)
         
-        # Write SRT
+        # Write SRT with strict 32-char line width and max 2 lines
         srt_writer = get_writer("srt", output_dir)
-        srt_writer(result, audio_path, {"max_line_width": 40, "max_line_count": 2, "highlight_words": False})
+        srt_writer(result, audio_path, {"max_line_width": 32, "max_line_count": 2, "highlight_words": False})
         
         audio_basename = os.path.basename(audio_path)
         expected_srt_path = os.path.join(output_dir, audio_basename + ".srt")

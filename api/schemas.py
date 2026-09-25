@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from .models import VideoStatus, SocialPlatform
+from .models import VideoStatus, SocialPlatform, PublicationStatus
 
 class UserBase(BaseModel):
     email: str
@@ -282,4 +282,44 @@ class ScheduleBatchResponse(BaseModel):
     message: str
 
 
+# ---------------------------------------------------------------------- #
+# Phase 5 (Extended): Approve & Publish — Per-Platform Publication Tracking
+# ---------------------------------------------------------------------- #
 
+class ApproveAndPublishRequest(BaseModel):
+    """
+    Payload for the Approve & Publish action.
+    selected_platforms: list of platform strings (e.g. ["instagram", "youtube"]).
+    youtube_privacy: public | unlisted | private (default: public)
+    tiktok_privacy: PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | SELF_ONLY
+    use_sandbox: If True, uses mock provider for safe zero-credential testing.
+    """
+    selected_platforms: List[str]   # e.g. ["instagram", "tiktok"]
+    youtube_privacy: str = "public"
+    tiktok_privacy: str = "PUBLIC_TO_EVERYONE"
+    use_sandbox: bool = False        # Safe test mode uses mock provider
+
+
+class VideoPublicationResponse(BaseModel):
+    id: int
+    video_id: int
+    platform: str
+    status: PublicationStatus
+    platform_post_id: Optional[str] = None
+    post_url: Optional[str] = None
+    error_message: Optional[str] = None
+    attempt_count: int = 0
+    created_at: datetime
+    published_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ApproveAndPublishResponse(BaseModel):
+    video_id: int
+    video_status: str
+    selected_platforms: List[str]
+    publications: List[VideoPublicationResponse]
+    summary: Dict[str, str]   # {"instagram": "PUBLISHED", "tiktok": "FAILED", "youtube": "NOT_SELECTED"}
+    message: str

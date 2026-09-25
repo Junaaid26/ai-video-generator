@@ -173,7 +173,7 @@ def render_visual_generation_status(video):
         st.warning(f"Local visual generation fell back to the development mock provider: {status.get('fallback_reason')}")
 
 
-def render_scene_visual_previews(video):
+def render_scene_visual_previews(video, key_prefix: str = ""):
     vid = video["id"]
     plan = video.get("plan") or {}
     scenes = plan.get("scenes", [])
@@ -189,6 +189,7 @@ def render_scene_visual_previews(video):
         assets = []
     assets_by_scene = {a.get("scene_number"): a for a in assets}
 
+    prefix_str = f"{key_prefix}_" if key_prefix else ""
     for scene in scenes:
         scene_num = scene.get("scene_number")
         asset = assets_by_scene.get(scene_num, {})
@@ -210,7 +211,7 @@ def render_scene_visual_previews(video):
                 st.caption(f"Environment: {scene.get('environment', '')}")
                 st.caption(f"Characters: {scene.get('characters', '')}")
                 st.caption(f"Objects: {scene.get('objects', '')}")
-                if st.button("Regenerate Scene", key=f"regen_scene_{vid}_{scene_num}", disabled=not is_admin):
+                if st.button("Regenerate Scene", key=f"regen_scene_{prefix_str}{vid}_{scene_num}", disabled=not is_admin):
                     regen = requests.post(
                         f"{API_URL}/videos/{vid}/scenes/{scene_num}/regenerate",
                         headers=admin_headers,
@@ -225,8 +226,9 @@ def render_scene_visual_previews(video):
 # ---------------------------------------------------------------------- #
 # Phase 5: Publishing Settings & Platform Selection Widget
 # ---------------------------------------------------------------------- #
-def render_publishing_settings_widget(video):
+def render_publishing_settings_widget(video, key_prefix: str = ""):
     vid = video["id"]
+    prefix_str = f"{key_prefix}_" if key_prefix else ""
     with st.expander("🚀 Publish Settings & Platform Selection", expanded=(video.get("status") in ["APPROVED", "READY_TO_SCHEDULE"])):
         st.markdown("##### 📱 Select Social Media Platforms & Configure Metadata")
         st.caption("Official platform OAuth, $0-cost development, and strict platform compliance validation.")
@@ -264,11 +266,11 @@ def render_publishing_settings_widget(video):
         st.markdown("**Select Platforms to Target:**")
         col_cb1, col_cb2, col_cb3 = st.columns(3)
         with col_cb1:
-            use_yt = st.checkbox("📺 YouTube Shorts", value=("youtube" in existing_settings), key=f"cb_yt_{vid}")
+            use_yt = st.checkbox("📺 YouTube Shorts", value=("youtube" in existing_settings), key=f"cb_yt_{prefix_str}{vid}")
         with col_cb2:
-            use_ig = st.checkbox("📸 Instagram Reels", value=("instagram" in existing_settings), key=f"cb_ig_{vid}")
+            use_ig = st.checkbox("📸 Instagram Reels", value=("instagram" in existing_settings), key=f"cb_ig_{prefix_str}{vid}")
         with col_cb3:
-            use_tt = st.checkbox("🎵 TikTok", value=("tiktok" in existing_settings), key=f"cb_tt_{vid}")
+            use_tt = st.checkbox("🎵 TikTok", value=("tiktok" in existing_settings), key=f"cb_tt_{prefix_str}{vid}")
 
         plan = video.get("plan") or {}
         base_title = video.get("title") or plan.get("title") or f"Video #{vid}"
@@ -290,18 +292,18 @@ def render_publishing_settings_widget(video):
                 has_missing_account = True
             else:
                 acc_options = {acc["id"]: f"{acc.get('account_name', 'YouTube Channel')} ({acc.get('account_handle', '')}) {'[Sandbox]' if acc.get('is_mock') else ''}" for acc in yt_accounts}
-                yt_acc_id = st.selectbox("YouTube Channel", options=list(acc_options.keys()), format_func=lambda x: acc_options[x], key=f"yt_acc_{vid}")
+                yt_acc_id = st.selectbox("YouTube Channel", options=list(acc_options.keys()), format_func=lambda x: acc_options[x], key=f"yt_acc_{prefix_str}{vid}")
 
                 yt_prev = (existing_settings.get("youtube") or {}).get("platform_metadata") or {}
-                yt_title = st.text_input("Title (max 100 chars)", value=yt_prev.get("title", base_title)[:100], max_chars=100, key=f"yt_title_{vid}")
+                yt_title = st.text_input("Title (max 100 chars)", value=yt_prev.get("title", base_title)[:100], max_chars=100, key=f"yt_title_{prefix_str}{vid}")
                 st.caption(f"Length: {len(yt_title)}/100 characters")
 
                 default_desc = f"{base_caption}\n\n{tags_str}\n\n{base_narration}"
-                yt_desc = st.text_area("Description (max 5000 chars)", value=yt_prev.get("description", default_desc)[:5000], height=90, key=f"yt_desc_{vid}")
+                yt_desc = st.text_area("Description (max 5000 chars)", value=yt_prev.get("description", default_desc)[:5000], height=90, key=f"yt_desc_{prefix_str}{vid}")
 
                 priv_opts = ["public", "unlisted", "private"]
                 default_priv = yt_prev.get("privacy", "public")
-                yt_priv = st.selectbox("Privacy Status", priv_opts, index=priv_opts.index(default_priv) if default_priv in priv_opts else 0, key=f"yt_priv_{vid}")
+                yt_priv = st.selectbox("Privacy Status", priv_opts, index=priv_opts.index(default_priv) if default_priv in priv_opts else 0, key=f"yt_priv_{prefix_str}{vid}")
 
                 selected_platforms_payload.append({
                     "platform": "youtube",
@@ -324,14 +326,14 @@ def render_publishing_settings_widget(video):
                 has_missing_account = True
             else:
                 acc_options = {acc["id"]: f"{acc.get('account_name', 'Instagram Account')} ({acc.get('account_handle', '')}) {'[Sandbox]' if acc.get('is_mock') else ''}" for acc in ig_accounts}
-                ig_acc_id = st.selectbox("Instagram Account", options=list(acc_options.keys()), format_func=lambda x: acc_options[x], key=f"ig_acc_{vid}")
+                ig_acc_id = st.selectbox("Instagram Account", options=list(acc_options.keys()), format_func=lambda x: acc_options[x], key=f"ig_acc_{prefix_str}{vid}")
 
                 ig_prev = (existing_settings.get("instagram") or {}).get("platform_metadata") or {}
                 default_ig_cap = f"{base_caption}\n\n{tags_str}".strip()
-                ig_caption = st.text_area("Caption (max 2200 chars)", value=ig_prev.get("caption", default_ig_cap)[:2200], max_chars=2200, height=90, key=f"ig_cap_{vid}")
+                ig_caption = st.text_area("Caption (max 2200 chars)", value=ig_prev.get("caption", default_ig_cap)[:2200], max_chars=2200, height=90, key=f"ig_cap_{prefix_str}{vid}")
                 st.caption(f"Length: {len(ig_caption)}/2200 characters")
 
-                ig_feed = st.checkbox("Share to Instagram Feed", value=ig_prev.get("share_to_feed", True), key=f"ig_feed_{vid}")
+                ig_feed = st.checkbox("Share to Instagram Feed", value=ig_prev.get("share_to_feed", True), key=f"ig_feed_{prefix_str}{vid}")
 
                 selected_platforms_payload.append({
                     "platform": "instagram",
@@ -353,24 +355,24 @@ def render_publishing_settings_widget(video):
                 has_missing_account = True
             else:
                 acc_options = {acc["id"]: f"{acc.get('account_name', 'TikTok Account')} ({acc.get('account_handle', '')}) {'[Sandbox]' if acc.get('is_mock') else ''}" for acc in tt_accounts}
-                tt_acc_id = st.selectbox("TikTok Account", options=list(acc_options.keys()), format_func=lambda x: acc_options[x], key=f"tt_acc_{vid}")
+                tt_acc_id = st.selectbox("TikTok Account", options=list(acc_options.keys()), format_func=lambda x: acc_options[x], key=f"tt_acc_{prefix_str}{vid}")
 
                 tt_prev = (existing_settings.get("tiktok") or {}).get("platform_metadata") or {}
                 default_tt_cap = f"{base_caption} {tags_str}".strip()
-                tt_caption = st.text_area("Post Caption (max 2200 chars)", value=tt_prev.get("caption", default_tt_cap)[:2200], max_chars=2200, height=80, key=f"tt_cap_{vid}")
+                tt_caption = st.text_area("Post Caption (max 2200 chars)", value=tt_prev.get("caption", default_tt_cap)[:2200], max_chars=2200, height=80, key=f"tt_cap_{prefix_str}{vid}")
                 st.caption(f"Length: {len(tt_caption)}/2200 characters")
 
                 tt_priv_opts = ["PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "SELF_ONLY"]
                 cur_tt_priv = tt_prev.get("privacy", "PUBLIC_TO_EVERYONE")
-                tt_priv = st.selectbox("Privacy Level", tt_priv_opts, index=tt_priv_opts.index(cur_tt_priv) if cur_tt_priv in tt_priv_opts else 0, key=f"tt_priv_{vid}")
+                tt_priv = st.selectbox("Privacy Level", tt_priv_opts, index=tt_priv_opts.index(cur_tt_priv) if cur_tt_priv in tt_priv_opts else 0, key=f"tt_priv_{prefix_str}{vid}")
 
                 tc1, tc2, tc3 = st.columns(3)
                 with tc1:
-                    tt_comments = st.checkbox("Allow Comments", value=tt_prev.get("allow_comments", True), key=f"tt_comm_{vid}")
+                    tt_comments = st.checkbox("Allow Comments", value=tt_prev.get("allow_comments", True), key=f"tt_comm_{prefix_str}{vid}")
                 with tc2:
-                    tt_duet = st.checkbox("Allow Duet", value=tt_prev.get("allow_duet", True), key=f"tt_duet_{vid}")
+                    tt_duet = st.checkbox("Allow Duet", value=tt_prev.get("allow_duet", True), key=f"tt_duet_{prefix_str}{vid}")
                 with tc3:
-                    tt_stitch = st.checkbox("Allow Stitch", value=tt_prev.get("allow_stitch", True), key=f"tt_stitch_{vid}")
+                    tt_stitch = st.checkbox("Allow Stitch", value=tt_prev.get("allow_stitch", True), key=f"tt_stitch_{prefix_str}{vid}")
 
                 selected_platforms_payload.append({
                     "platform": "tiktok",
@@ -386,7 +388,7 @@ def render_publishing_settings_widget(video):
 
         st.markdown("")
         if use_yt or use_ig or use_tt:
-            if st.button("💾 Save & Validate Configuration", key=f"btn_save_val_{vid}", type="primary", width="stretch"):
+            if st.button("💾 Save & Validate Configuration", key=f"btn_save_val_{prefix_str}{vid}", type="primary", width="stretch"):
                 if has_missing_account:
                     st.error("Cannot validate: One or more selected platforms are missing a connected account.")
                 else:
@@ -412,6 +414,213 @@ def render_publishing_settings_widget(video):
                             st.error(f"Failed to save configuration: {save_res.text}")
         else:
             st.info("Check one or more platforms above to configure publishing.")
+
+
+# ---------------------------------------------------------------------- #
+# Phase 5: Approve & Publish Widget (shown in Pending Approval)
+# ---------------------------------------------------------------------- #
+_PLATFORM_ICONS = {"youtube": "📺", "instagram": "📸", "tiktok": "🎵"}
+_PLATFORM_LABELS = {"youtube": "YouTube Shorts", "instagram": "Instagram Reels", "tiktok": "TikTok"}
+
+
+def render_publication_results(vid: int):
+    """Show per-platform publication status with retry buttons for FAILED platforms."""
+    try:
+        res = requests.get(f"{API_URL}/videos/{vid}/publications", timeout=4)
+        if res.status_code != 200:
+            return
+        pubs = res.json()
+        if not pubs:
+            return
+    except Exception:
+        return
+
+    st.markdown("#### 📊 Publishing Results")
+    status_icons = {
+        "PUBLISHED":    "🟢",
+        "FAILED":       "🔴",
+        "NOT_SELECTED": "⚪",
+        "QUEUED":       "🕐",
+        "PUBLISHING":   "🔄",
+    }
+
+    cols = st.columns(len(pubs))
+    for i, pub in enumerate(pubs):
+        plat = pub.get("platform", "?")
+        status = pub.get("status", "UNKNOWN")
+        icon = status_icons.get(status, "❓")
+        label = _PLATFORM_LABELS.get(plat, plat.capitalize())
+        plat_icon = _PLATFORM_ICONS.get(plat, "🌐")
+        with cols[i]:
+            st.markdown(f"**{plat_icon} {label}**")
+            st.markdown(f"{icon} **{status}**")
+            if pub.get("post_url"):
+                st.markdown(f"[View Post]({pub['post_url']})")
+            if pub.get("platform_post_id"):
+                st.caption(f"Post ID: `{pub['platform_post_id']}`")
+            if pub.get("error_message") and status == "FAILED":
+                st.caption(f"Error: {pub['error_message'][:120]}")
+            # Retry button only for FAILED platforms
+            if status == "FAILED":
+                if st.button(f"🔁 Retry {label}", key=f"retry_{vid}_{plat}", type="secondary"):
+                    with st.spinner(f"Retrying {label}..."):
+                        retry_res = requests.post(
+                            f"{API_URL}/videos/{vid}/publications/{plat}/retry",
+                            headers=admin_headers,
+                            params={"use_sandbox": "false"}
+                        )
+                        if retry_res.status_code == 200:
+                            result = retry_res.json()
+                            new_status = result.get("status", "UNKNOWN")
+                            if new_status == "PUBLISHED":
+                                st.success(f"✅ {label} published successfully!")
+                            else:
+                                st.error(f"Retry failed: {result.get('error_message', 'Unknown error')}")
+                        else:
+                            st.error(f"Retry request failed: {retry_res.text[:200]}")
+                    st.rerun()
+            if pub.get("attempt_count", 0) > 0:
+                st.caption(f"Attempts: {pub['attempt_count']}")
+
+
+def render_approve_and_publish_widget(video: dict, key_prefix: str = ""):
+    """
+    Shown in Pending Approval. Lets the user:
+    1. Select which platforms to publish to (only connected accounts are selectable).
+    2. Configure YouTube privacy and TikTok privacy.
+    3. Click 'Approve & Publish' — approves the video and publishes to selected platforms.
+    4. Shows per-platform result (Published / Failed / Not Selected) with retry buttons.
+    """
+    vid = video["id"]
+    prefix_str = f"{key_prefix}_" if key_prefix else ""
+
+    # Fetch connected accounts
+    try:
+        acc_res = requests.get(f"{API_URL}/social/accounts", timeout=3)
+        accounts = acc_res.json() if acc_res.status_code == 200 else []
+    except Exception:
+        accounts = []
+
+    accounts_by_platform: dict = {"youtube": [], "instagram": [], "tiktok": []}
+    for acc in accounts:
+        p = acc.get("platform", "").lower()
+        if p in accounts_by_platform:
+            accounts_by_platform[p].append(acc)
+
+    # Check if publications already exist (i.e. already approved & published)
+    try:
+        pub_res = requests.get(f"{API_URL}/videos/{vid}/publications", timeout=3)
+        existing_pubs = pub_res.json() if pub_res.status_code == 200 else []
+    except Exception:
+        existing_pubs = []
+
+    if existing_pubs:
+        # Already published — show results and retry buttons
+        render_publication_results(vid)
+        return
+
+    st.markdown("---")
+    st.markdown("### 🚀 Approve & Publish")
+    st.caption("Select the platforms to publish this video to, then click **Approve & Publish**.")
+
+    # Platform selection UI
+    st.markdown("#### Publishing Platforms")
+    plat_cols = st.columns(3)
+    platform_selections = {}
+    has_missing_account = False
+
+    for i, platform in enumerate(["instagram", "tiktok", "youtube"]):
+        with plat_cols[i]:
+            icon = _PLATFORM_ICONS[platform]
+            label = _PLATFORM_LABELS[platform]
+            connected = accounts_by_platform.get(platform, [])
+
+            if connected:
+                acc_names = ", ".join(
+                    acc.get("account_handle") or acc.get("account_name") or "Account"
+                    for acc in connected[:1]
+                )
+                st.markdown(f"**{icon} {label}**")
+                st.caption(f"🟢 Connected: `{acc_names}`")
+                selected = st.checkbox(f"Publish to {label}", key=f"chk_{prefix_str}{platform}_{vid}", value=False)
+                platform_selections[platform] = selected
+            else:
+                st.markdown(f"**{icon} {label}**")
+                st.warning("⚠️ Not connected")
+                st.caption("Go to **Social Accounts** to connect.")
+                st.checkbox(f"Publish to {label}", key=f"chk_{prefix_str}{platform}_{vid}", value=False, disabled=True)
+                platform_selections[platform] = False
+
+    selected_platforms = [p for p, v in platform_selections.items() if v]
+
+    # Advanced options (collapsed)
+    with st.expander("⚙️ Advanced Privacy Options"):
+        yt_priv_opts = ["public", "unlisted", "private"]
+        yt_privacy = st.selectbox("YouTube Visibility", yt_priv_opts, index=0, key=f"yt_priv_ap_{prefix_str}{vid}")
+        tt_priv_opts = ["PUBLIC_TO_EVERYONE", "MUTUAL_FOLLOW_FRIENDS", "SELF_ONLY"]
+        tt_privacy = st.selectbox("TikTok Privacy", tt_priv_opts, index=0, key=f"tt_priv_ap_{prefix_str}{vid}")
+        use_sandbox = st.checkbox(
+            "🧪 Safe Test Mode (Sandbox)",
+            value=False,
+            key=f"sandbox_ap_{prefix_str}{vid}",
+            help="Uses mock provider — no real publishing. Safe for testing the full workflow without credentials."
+        )
+
+    # Approve & Publish button
+    st.markdown("")
+    can_approve = is_admin and len(selected_platforms) > 0
+    btn_label = "✅ Approve & Publish" if selected_platforms else "✅ Approve & Publish (select a platform above)"
+
+    if st.button(
+        btn_label,
+        key=f"btn_approve_publish_{prefix_str}{vid}",
+        type="primary",
+        disabled=not can_approve,
+    ):
+        if not is_admin:
+            st.error("Action denied: Admin authorization required.")
+        elif not selected_platforms:
+            st.warning("Please select at least one platform to publish to.")
+        else:
+            with st.spinner(f"Approving and publishing to {', '.join(selected_platforms)}..."):
+                payload = {
+                    "selected_platforms": selected_platforms,
+                    "youtube_privacy": yt_privacy,
+                    "tiktok_privacy": tt_privacy,
+                    "use_sandbox": use_sandbox,
+                }
+                try:
+                    resp = requests.post(
+                        f"{API_URL}/videos/{vid}/approve-and-publish",
+                        json=payload,
+                        headers=admin_headers,
+                        timeout=120
+                    )
+                    if resp.status_code == 200:
+                        result = resp.json()
+                        summary = result.get("summary", {})
+                        published_count = sum(1 for s in summary.values() if s == "PUBLISHED")
+                        failed_count = sum(1 for p in selected_platforms if summary.get(p) == "FAILED")
+
+                        if published_count > 0:
+                            st.success(f"🎉 Video approved! {result.get('message', '')}")
+                        else:
+                            st.warning(f"⚠️ Video approved but publishing failed: {result.get('message', '')}")
+
+                        if failed_count > 0:
+                            st.error(f"❌ {failed_count} platform(s) failed to publish. Use Retry below.")
+                        st.rerun()
+                    else:
+                        try:
+                            err = resp.json().get("detail", resp.text)
+                        except Exception:
+                            err = resp.text
+                        st.error(f"Approve & Publish failed: {err}")
+                except Exception as e:
+                    st.error(f"Connection error: {e}")
+
+    if not is_admin:
+        st.info("ℹ️ Admin authorization required to approve and publish.")
 
 
 # ---------------------------------------------------------------------- #
@@ -553,7 +762,7 @@ elif nav_selection == "Pending Approval":
                             else:
                                 st.caption("No scene breakdown details.")
 
-                            render_scene_visual_previews(video)
+                            render_scene_visual_previews(video, key_prefix="pending")
 
                         st.divider()
 
@@ -652,6 +861,11 @@ elif nav_selection == "Pending Approval":
                                             err = save_res.json().get("detail", save_res.text)
                                             st.error(f"Failed to save changes: {err}")
 
+                        # ---------------------------------------------------------------- #
+                        # Phase 5: Approve & Publish — Platform Selection + Publishing
+                        # ---------------------------------------------------------------- #
+                        render_approve_and_publish_widget(video, key_prefix=f"pending_{vid}")
+
                         # Render Audit Log & Version History
                         render_audit_log(vid)
                         st.write("---")
@@ -730,23 +944,23 @@ elif nav_selection == "My Videos / Projects":
                                     else:
                                         st.caption("No video file generated yet.")
 
-                                render_scene_visual_previews(v)
+                                render_scene_visual_previews(v, key_prefix=f"tab_{tab_idx}")
 
                                 # Phase 5: Publishing Settings on Approved and Ready to Schedule videos
                                 if v_status in ["APPROVED", "READY_TO_SCHEDULE"]:
-                                    render_publishing_settings_widget(v)
+                                    render_publishing_settings_widget(v, key_prefix=f"tab_{tab_idx}")
 
                                 # Contextual Quick Actions per status
                                 st.markdown("##### Quick Actions")
                                 qcol1, qcol2, qcol3 = st.columns(3)
                                 
                                 if v_status in ["DRAFT", "REJECTED", "FAILED"]:
-                                    if qcol1.button(f"Generate Video #{vid}", key=f"tab_gen_{vid}"):
+                                    if qcol1.button(f"Generate Video #{vid}", key=f"tab_gen_{tab_idx}_{vid}"):
                                         requests.post(f"{API_URL}/videos/{vid}/generate")
                                         st.rerun()
 
                                 if v_status == "PENDING_APPROVAL":
-                                    if qcol1.button(f"Approve #{vid}", key=f"tab_app_{vid}", type="primary"):
+                                    if qcol1.button(f"Approve #{vid}", key=f"tab_app_{tab_idx}_{vid}", type="primary"):
                                         if is_admin:
                                             requests.post(f"{API_URL}/videos/{vid}/approve", headers=admin_headers)
                                             st.rerun()
@@ -761,7 +975,7 @@ elif nav_selection == "My Videos / Projects":
                                                 data=file_handle,
                                                 file_name=f"video_{vid}.mp4",
                                                 mime="video/mp4",
-                                                key=f"dl_{vid}"
+                                                key=f"dl_{tab_idx}_{vid}"
                                             )
 
                                 # Render Audit Log & Version History

@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Privacy Policy — AI Video Studio</title>
+  <meta name="description" content="Privacy Policy for AI Video Studio describing data collection, storage, token encryption, AI processing, and third-party platform integrations.">
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+
+  <!-- Navigation -->
+  <header>
+    <div class="container">
+      <nav>
+        <a href="../" class="brand">
+          <div class="brand-icon">▶</div>
+          AI Video Studio
+        </a>
+        <ul class="nav-links">
+          <li><a href="../">Home</a></li>
+          <li><a href="./" class="active">Privacy Policy</a></li>
+          <li><a href="../terms/">Terms of Service</a></li>
+        </ul>
+      </nav>
+    </div>
+  </header>
+
+  <!-- Legal Content -->
+  <main class="legal-container">
+    <div class="legal-header">
+      <h1>Privacy Policy</h1>
+      <div class="legal-meta">
+        Application: <strong>AI Video Studio</strong> | Effective Date: September 2026
+      </div>
+    </div>
+
+    <div class="legal-content">
+      <p>
+        This Privacy Policy explains how <strong>AI Video Studio</strong> ("we", "our", or "the Application") collects, stores, uses, and protects information when you use our short-form video creation and social media publishing software.
+      </p>
+      <p>
+        AI Video Studio is designed to create short-form vertical videos using artificial intelligence models and, only upon explicit manual approval by the user, publish those videos to user-connected social media accounts including TikTok, YouTube, and Instagram.
+      </p>
+
+      <div class="notice-box">
+        <strong>Key Commitment:</strong> We only collect and store data necessary to generate videos and publish them to platforms you explicitly connect. We do not sell your personal information, and we do not run third-party behavioral advertising trackers.
+      </div>
+
+      <h2>1. Information We Collect and Store</h2>
+      <p>
+        Based on the functionality of AI Video Studio, the following categories of data are collected and stored in the application's local database and server filesystem:
+      </p>
+
+      <h3>A. User Account Information</h3>
+      <ul>
+        <li><strong>Credentials:</strong> If user authentication is enabled, user email addresses and cryptographically hashed passwords are stored in the application database.</li>
+      </ul>
+
+      <h3>B. Connected Social Media Account Information</h3>
+      <p>
+        When you connect a third-party social media platform (such as TikTok, YouTube, or Instagram) via official OAuth authorization flows, we receive and store:
+      </p>
+      <ul>
+        <li><strong>Platform Identifiers:</strong> The platform name (e.g. <code>tiktok</code>, <code>youtube</code>, <code>instagram</code>) and your platform-specific unique identifier (e.g., TikTok Open ID, YouTube Channel ID, Instagram Business Account ID).</li>
+        <li><strong>Profile Information:</strong> Public account display name, account handle (username), avatar/profile image URL, and public profile URL.</li>
+        <li><strong>OAuth Tokens &amp; Encryption:</strong> Access tokens and refresh tokens received during OAuth authorization. <strong>OAuth tokens are never stored in plain text.</strong> All tokens are encrypted at rest using AES-128-CBC with HMAC-SHA256 authenticated symmetric encryption (Fernet) before being saved to the database.</li>
+        <li><strong>Connection Status:</strong> Token expiration timestamps and account status flags (Active, Expired, Revoked, or Disconnected).</li>
+      </ul>
+
+      <h3>C. Video Generation Content &amp; Media Assets</h3>
+      <ul>
+        <li><strong>User Inputs:</strong> Creative prompts, duration selections, target platform settings, and chosen visual styles.</li>
+        <li><strong>Generated Content:</strong> AI-generated titles, video scripts, complete narration text, captions, hashtags, and scene-by-scene visual descriptions.</li>
+        <li><strong>Media Files:</strong> Rendered scene images, synthesized audio voiceovers, timed subtitle files (.srt/.ass), and final composite MP4 video files stored in the local server storage.</li>
+        <li><strong>Lifecycle &amp; Quality Assurance Records:</strong> Video status tracking (Draft, Generating, Pending Approval, Approved, Published, Failed), generation attempt timestamps, automated QA validation results, and user approval logs.</li>
+      </ul>
+
+      <h3>D. Publishing Logs</h3>
+      <ul>
+        <li><strong>Publication History:</strong> Records of videos submitted for social publishing, including target platform, destination account ID, publishing timestamp, publication status, platform-assigned post ID, public post URL, and error messages if a publishing attempt fails.</li>
+      </ul>
+
+      <h2>2. Third-Party Service Providers &amp; Integrations</h2>
+      <p>
+        AI Video Studio interacts with specific external services to perform video generation and social publishing:
+      </p>
+
+      <h3>A. Social Media Publishing Platforms</h3>
+      <ul>
+        <li>
+          <strong>TikTok:</strong> Connected via official TikTok Login Kit and TikTok Content Posting API v2 (Direct Post). Used strictly to authenticate your account and upload user-approved videos with captions and privacy settings to your TikTok feed. Requested scopes include <code>user.info.basic</code> and <code>video.publish</code>.
+        </li>
+        <li>
+          <strong>YouTube:</strong> Connected via Google OAuth2 and the YouTube Data API v3. Used strictly to upload user-approved videos as YouTube Shorts.
+        </li>
+        <li>
+          <strong>Instagram:</strong> Connected via Meta Graph API (Instagram Content Publishing API). Used strictly to publish user-approved vertical video containers to verified Instagram Professional accounts.
+        </li>
+      </ul>
+
+      <h3>B. AI &amp; Media Generation Services</h3>
+      <ul>
+        <li><strong>Language Models (LLM):</strong> Prompts and script generation requests are processed through configured AI providers (such as Google Gemini or OpenAI) to generate scripts and scene outlines.</li>
+        <li><strong>Text-to-Speech (TTS):</strong> Narration scripts are sent to voice synthesis providers (such as ElevenLabs or local edge-tts) to produce audio tracks.</li>
+        <li><strong>Visual Generation:</strong> Scene descriptions are sent to image generation APIs (such as Hugging Face Inference API utilizing FLUX.1-schnell, Replicate, or local image generators) to create scene imagery.</li>
+        <li><strong>Transcription &amp; Subtitles:</strong> Word-level subtitle timestamps are processed locally using OpenAI Whisper models without sending audio to external transcription third parties.</li>
+        <li><strong>Video Composition:</strong> Video assembly, audio muxing, and subtitle burning are executed locally using FFmpeg and MoviePy.</li>
+      </ul>
+
+      <h2>3. How Information Is Used</h2>
+      <p>We use the collected information strictly for:</p>
+      <ul>
+        <li>Generating requested video scripts, visuals, audio, and subtitles according to user prompts.</li>
+        <li>Providing an administrative preview and approval dashboard for creators to review and approve videos before distribution.</li>
+        <li>Authenticating with connected social media platforms via official OAuth2 protocols.</li>
+        <li>Publishing approved video files to selected platforms only upon deliberate, manual user confirmation.</li>
+        <li>Maintaining publication records and delivery status.</li>
+      </ul>
+
+      <h2>4. Analytics, Cookies, and Tracking</h2>
+      <p>
+        <strong>No Behavioral Tracking:</strong> AI Video Studio does not use third-party analytics trackers, advertising networks, tracking pixels, or cross-site tracking cookies.
+      </p>
+
+      <h2>5. Data Retention &amp; Security</h2>
+      <ul>
+        <li><strong>Storage Location:</strong> Project database records, generated media files, and application logs are stored within the application's local environment and configured database.</li>
+        <li><strong>Credential Protection:</strong> All social media OAuth access and refresh tokens are encrypted at rest using AES-128-CBC and HMAC-SHA256 authenticated symmetric encryption. Plain-text credentials are never written to disk or logged.</li>
+        <li><strong>Retention:</strong> Video files, scripts, and publication history remain stored until deleted or purged by the user or operator.</li>
+      </ul>
+
+      <h2>6. Account Disconnection &amp; Data Deletion</h2>
+      <p>
+        You have direct control over your connected social media accounts:
+      </p>
+      <ul>
+        <li>
+          <strong>Disconnecting Accounts:</strong> You can disconnect your TikTok, YouTube, or Instagram account at any time through the application's Social Accounts dashboard. Disconnecting an account immediately removes or revokes access tokens, preventing any future publishing.
+        </li>
+        <li>
+          <strong>Third-Party Revocation:</strong> You can also revoke AI Video Studio's access directly at any time from your platform account security settings:
+          <ul>
+            <li>TikTok: <em>Settings and privacy &rarr; Security &rarr; Manage app permissions</em></li>
+            <li>Google / YouTube: <em>Google Account &rarr; Security &rarr; Third-party apps with account access</em></li>
+            <li>Meta / Instagram: <em>Settings &rarr; Apps and Websites</em></li>
+          </ul>
+        </li>
+        <li>
+          <strong>Data Deletion Requests:</strong> If you wish to request the deletion of any stored database records, metadata, or media files associated with your account, please contact the operator.
+        </li>
+      </ul>
+
+      <h2>7. Children's Privacy</h2>
+      <p>
+        AI Video Studio is intended for creators and developers of legal age to operate social media publishing accounts. We do not knowingly collect personal information from individuals under the age of 13 (or under the applicable age of digital consent in your jurisdiction).
+      </p>
+
+      <h2>8. Changes to This Privacy Policy</h2>
+      <p>
+        We may update this Privacy Policy from time to time to reflect modifications in software functionality, API updates from supported social media platforms, or legal requirements. Updated versions will be posted on this page with an updated effective date.
+      </p>
+
+      <h2>9. Contact Information</h2>
+      <p>
+        For inquiries regarding this Privacy Policy, your connected accounts, or data handling practices, please contact the application operator:
+      </p>
+      <ul>
+        <li><strong>Application:</strong> AI Video Studio</li>
+        <li><strong>Project Repository:</strong> <a href="https://github.com/Junaaid26/ai-video-generator" style="color: #a5b4fc;">github.com/Junaaid26/ai-video-generator</a></li>
+        <li><strong>Operator Contact Email:</strong> <em>To be provided by the application operator prior to public commercial launch. Inquiries may be submitted via the project repository issue tracker.</em></li>
+      </ul>
+    </div>
+  </main>
+
+  <!-- Footer -->
+  <footer>
+    <div class="container">
+      <div class="footer-inner">
+        <div>
+          <strong>AI Video Studio</strong> — AI-Assisted Short-Form Video Creation & Social Publishing
+        </div>
+        <div class="footer-links">
+          <a href="../">Home</a>
+          <a href="./">Privacy Policy</a>
+          <a href="../terms/">Terms of Service</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+</body>
+</html>

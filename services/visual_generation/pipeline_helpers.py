@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from services.visual_generation import VisualGenerationService, build_consistency_context
-from services.visual_generation.base import VisualGenerationRequest
+from services.visual_generation.base import VisualGenerationRequest, validate_generated_image
 
 
 def init_visual_status(scenes: list) -> dict:

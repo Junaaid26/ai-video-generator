@@ -1,5 +1,7 @@
 """Build image-generation prompts from structured scene data."""
 
+import re
+
 VISUAL_STYLE_SUFFIXES = {
     "realistic": "realistic photography, natural lighting, high detail, photorealistic",
     "cinematic": "cinematic film still, dramatic lighting, shallow depth of field, movie scene",
@@ -10,9 +12,39 @@ VISUAL_STYLE_SUFFIXES = {
 }
 
 NEGATIVE_PROMPT = (
-    "text, words, letters, watermark, logo, caption, subtitle, typography, "
-    "banner, title card, meme text, blurry, low quality, distorted faces"
+    "text, typography, captions, subtitles, words, letters, numbers, logos, watermarks, "
+    "UI elements, social media buttons, banners, posters, signs, labels, "
+    "duplicated people, duplicate subjects, extra limbs, malformed hands, distorted faces, distorted bodies, "
+    "split screen, collage, comic panels, borders, frames, black bars, artificial text overlays, blurry, low quality"
 )
+
+# Text patterns to strip from visual prompts (e.g., narration quotes, text overlays)
+_TEXT_CLEAN_PATTERNS = [
+    r'["\'].*?["\']',  # Any quoted text like "Follow for more"
+    r'(?i)\btext\s+saying\s+.*',
+    r'(?i)\btext\s+overlay.*',
+    r'(?i)\btitle\s+card.*',
+    r'(?i)\bsubtitles?.*',
+    r'(?i)\bcaptions?.*',
+    r'(?i)\bfollow\s+for\s+more.*',
+    r'(?i)\blike\s+and\s+subscribe.*',
+    r'(?i)\bwords?\s+saying.*',
+    r'(?i)\bbanner\s+saying.*',
+    r'(?i)\bno\s+text.*',  # remove old "no text" appended strings since negative prompt handles it
+    r'(?i)\bvertical\s+9:16\s+composition.*',
+]
+
+
+def clean_visual_text(text: str) -> str:
+    """Strip text overlays, quoted narration, and non-visual directives."""
+    if not text:
+        return ""
+    cleaned = text
+    for pat in _TEXT_CLEAN_PATTERNS:
+        cleaned = re.sub(pat, "", cleaned)
+    # Remove leftover trailing/leading punctuation or spaces
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-:")
+    return cleaned
 
 
 def build_image_prompt(
@@ -24,33 +56,66 @@ def build_image_prompt(
     visual_style: str = "realistic",
     consistency_context: str = "",
 ) -> str:
-    """Assemble a full diffusion prompt from structured scene fields."""
+    """
+    Assemble a structured, high-quality prompt for diffusion models.
+    Formats explicit prompt sections: SUBJECT, ACTION, ENVIRONMENT, COMPOSITION, CAMERA, LIGHTING, VISUAL STYLE, COLOR/ATMOSPHERE.
+    """
     style_key = (visual_style or "realistic").lower().strip()
     style_suffix = VISUAL_STYLE_SUFFIXES.get(style_key, VISUAL_STYLE_SUFFIXES["realistic"])
 
-    parts = []
+    c_visual = clean_visual_text(visual_prompt)
+    c_env = clean_visual_text(environment)
+    c_chars = clean_visual_text(characters)
+    c_objs = clean_visual_text(objects)
+    c_cam = clean_visual_text(camera_style)
+
+    # 1. Subject
+    subject = c_chars or "A primary subject"
     if consistency_context:
-        parts.append(consistency_context.strip())
+        c_ctx = clean_visual_text(consistency_context)
+        if c_ctx:
+            subject = f"{subject} ({c_ctx})"
 
-    if visual_prompt:
-        parts.append(visual_prompt.strip())
-    else:
-        scene_bits = [b for b in [environment, characters, objects] if b]
-        parts.append(", ".join(scene_bits) if scene_bits else "detailed scene")
+    # 2. Action
+    action = c_visual if c_visual else (f"Interacting naturally with {c_objs}" if c_objs else "Engaged in the scene")
 
-    if environment and environment not in visual_prompt:
-        parts.append(f"Environment: {environment.strip()}")
-    if characters and characters not in visual_prompt:
-        parts.append(f"Characters: {characters.strip()}")
-    if objects and objects not in visual_prompt:
-        parts.append(f"Objects: {objects.strip()}")
-    if camera_style:
-        parts.append(f"Camera: {camera_style.strip()}")
+    # 3. Environment
+    env = c_env or "Clean, realistic indoor/outdoor setting matching the scene context"
+    if c_objs and c_objs not in env:
+        env = f"{env}, featuring {c_objs}"
 
-    parts.append(style_suffix)
-    parts.append("vertical composition 9:16 portrait, no text on image")
+    # 4. Composition (Strict 9:16 Vertical Safe Area)
+    composition = (
+        "One primary subject, centered in middle 9:16 vertical safe zone, "
+        "three-quarter or medium portrait framing, clear subject-background separation, "
+        "strong visual hierarchy designed specifically for 9:16 vertical format"
+    )
 
-    return ", ".join(p for p in parts if p)
+    # 5. Camera
+    camera = c_cam or "Eye-level medium shot, sharp subject focus"
+
+    # 6. Lighting
+    lighting = "Natural soft daylight, professional balanced lighting"
+    if "cinematic" in style_key:
+        lighting = "Dramatic cinematic lighting, subtle lens flare, shallow depth of field"
+    elif "3d" in style_key:
+        lighting = "Studio octane render lighting, volumetric glow"
+
+    # 7. Atmosphere / Color
+    atmosphere = "Clean, vibrant, high-contrast, professional social media production quality"
+
+    structured_prompt = (
+        f"SUBJECT: {subject}\n"
+        f"ACTION: {action}\n"
+        f"ENVIRONMENT: {env}\n"
+        f"COMPOSITION: {composition}\n"
+        f"CAMERA: {camera}\n"
+        f"LIGHTING: {lighting}\n"
+        f"VISUAL STYLE: {style_suffix}\n"
+        f"COLOR/ATMOSPHERE: {atmosphere}"
+    )
+
+    return structured_prompt
 
 
 def build_consistency_context(scenes: list, up_to_scene: int) -> str:
@@ -67,13 +132,13 @@ def build_consistency_context(scenes: list, up_to_scene: int) -> str:
     styles = []
 
     for scene in prior:
-        chars = scene.get("characters") or ""
-        env = scene.get("environment") or ""
+        chars = clean_visual_text(scene.get("characters") or "")
+        env = clean_visual_text(scene.get("environment") or "")
         style = scene.get("visual_style") or ""
         if chars:
-            characters.append(chars.strip())
+            characters.append(chars)
         if env:
-            environments.append(env.strip())
+            environments.append(env)
         if style:
             styles.append(style.strip())
 
