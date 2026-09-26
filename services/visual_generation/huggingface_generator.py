@@ -8,7 +8,7 @@ from PIL import Image, ImageOps
 from huggingface_hub import InferenceClient
 
 from .base import VisualGenerationProvider, VisualGenerationRequest, VisualGenerationResult, validate_generated_image
-from .prompt_builder import NEGATIVE_PROMPT, build_image_prompt
+from .prompt_builder import NEGATIVE_PROMPT, build_image_prompt, build_dynamic_negative_prompt, validate_visual_prompt_grounding
 
 # Load environment variables
 load_dotenv()
@@ -74,6 +74,14 @@ class HuggingFaceGenerator(VisualGenerationProvider):
 
         os.makedirs(os.path.dirname(request.output_path) or ".", exist_ok=True)
 
+        is_valid, val_reason = validate_visual_prompt_grounding(
+            topic=request.topic,
+            claim=request.claim,
+            narration=request.narration,
+            visual_prompt=request.visual_prompt,
+        )
+
+        # Build topic-locked structured diffusion prompt
         prompt = build_image_prompt(
             visual_prompt=request.visual_prompt,
             environment=request.environment,
@@ -82,7 +90,25 @@ class HuggingFaceGenerator(VisualGenerationProvider):
             camera_style=request.camera_style,
             visual_style=request.visual_style,
             consistency_context=request.consistency_context,
+            topic=request.topic,
+            claim=request.claim,
+            narration=request.narration,
         )
+
+        # Build dynamic negative prompt based on topic
+        neg_prompt = request.negative_prompt or build_dynamic_negative_prompt(
+            topic=request.topic or request.visual_prompt,
+            claim=request.claim,
+            visual_style=request.visual_style,
+        )
+
+        # Debug logging for every scene (Requirement 11)
+        print(f"\n[Scene Visual Grounding] Scene {request.scene_number}:")
+        print(f"  Topic: {request.topic or 'N/A'}")
+        print(f"  Claim: {request.claim or 'N/A'}")
+        print(f"  Narration: {request.narration or 'N/A'}")
+        print(f"  Visual prompt: {request.visual_prompt}")
+        print(f"  Validation result: {'PASSED' if is_valid else f'REPAIRED ({val_reason})'}")
 
         try:
             model_id = _get_model_id()
@@ -94,13 +120,26 @@ class HuggingFaceGenerator(VisualGenerationProvider):
             gen_width = 576
             gen_height = 1024
 
-            img = client.text_to_image(
-                prompt=prompt,
-                negative_prompt=NEGATIVE_PROMPT,
-                model=model_id,
-                width=gen_width,
-                height=gen_height,
-            )
+            try:
+                img = client.text_to_image(
+                    prompt=prompt,
+                    negative_prompt=neg_prompt,
+                    model=model_id,
+                    width=gen_width,
+                    height=gen_height,
+                )
+            except Exception as e_prov:
+                err_text = str(e_prov).lower()
+                if "402" in str(e_prov) or "payment required" in err_text or "credits" in err_text or "quota" in err_text:
+                    print(f"[Hugging Face] Provider credits unavailable ({str(e_prov)[:60]}), using free serverless HF endpoint...")
+                    client = InferenceClient(api_key=api_key)
+                    img = client.text_to_image(
+                        prompt=prompt,
+                        negative_prompt=neg_prompt,
+                        model="stabilityai/stable-diffusion-xl-base-1.0",
+                    )
+                else:
+                    raise e_prov
 
             if not isinstance(img, Image.Image):
                 return VisualGenerationResult(

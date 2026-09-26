@@ -32,6 +32,12 @@ class Scene(BaseModel):
     image_url: Optional[str] = None
     visual_status: Optional[str] = None  # pending, generating, completed, failed
     is_mock_visual: Optional[bool] = None
+    # Informational unit fields for high-density educational content
+    fact_number: Optional[int] = None
+    topic: Optional[str] = None
+    claim: Optional[str] = None
+    explanation: Optional[str] = None
+    example: Optional[str] = None
 
 class VideoPlan(BaseModel):
     title: str
@@ -41,9 +47,14 @@ class VideoPlan(BaseModel):
     suggested_background_music: str
     caption: str
     hashtags: List[str]
+    hook: Optional[str] = None
+    topic: Optional[str] = None
+    closing: Optional[str] = None
+    facts: Optional[List[Dict[str, Any]]] = None
 
 class VideoBase(BaseModel):
-    prompt: str
+    prompt: Optional[str] = None
+    topic: Optional[str] = None
 
 class VideoCreate(VideoBase):
     duration: Optional[str] = "30-60 seconds"
@@ -51,6 +62,18 @@ class VideoCreate(VideoBase):
     style: Optional[str] = "Standard"
     target_platform: Optional[str] = "TikTok"
     visual_style: Optional[str] = "realistic"  # realistic, cinematic, 3d, illustration, anime, minimal
+    visual_provider: Optional[str] = None
+    selected_platforms: Optional[List[str]] = None
+    target_audience: Optional[str] = None
+    tone: Optional[str] = None
+    aspect_ratio: Optional[str] = "9:16"
+
+class VideoGenerateOptions(BaseModel):
+    visual_provider: Optional[str] = None
+    visual_style: Optional[str] = None
+    selected_platforms: Optional[List[str]] = None
+    scene_prompts: Optional[Dict[str, str]] = None
+
 
 class VideoUpdate(BaseModel):
     title: Optional[str] = None
@@ -304,6 +327,7 @@ class VideoPublicationResponse(BaseModel):
     id: int
     video_id: int
     platform: str
+    social_account_id: Optional[int] = None
     status: PublicationStatus
     platform_post_id: Optional[str] = None
     post_url: Optional[str] = None

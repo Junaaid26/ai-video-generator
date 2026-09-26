@@ -113,8 +113,7 @@ class VisualGenerationService:
 
         # Fallback chain: Hugging Face -> Replicate -> Local -> Mock
         if not result.success and not isinstance(self.provider, MockVisualGenerator):
-            mode = os.getenv("VISUAL_PROVIDER", "auto").lower()
-            if mode == "auto":
+            if True:
                 # Try next provider in chain
                 if isinstance(self.provider, HuggingFaceGenerator):
                     self._fallback_used = True
@@ -248,6 +247,9 @@ class VisualGenerationService:
                 width=width,
                 height=height,
                 output_path=output_path,
+                topic=scene.get("topic", ""),
+                claim=scene.get("claim", ""),
+                narration=scene.get("narration", ""),
             )
 
             result = self.generate_scene(request)

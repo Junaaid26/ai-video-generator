@@ -22,6 +22,10 @@ class VisualGenerationRequest:
     width: int = 1080
     height: int = 1920
     output_path: str = ""
+    topic: str = ""
+    claim: str = ""
+    narration: str = ""
+    negative_prompt: str = ""
 
 
 @dataclass

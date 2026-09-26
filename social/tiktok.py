@@ -36,6 +36,9 @@ class TikTokProvider(SocialPlatformProvider):
     AUTH_ENDPOINT = "https://www.tiktok.com/v2/auth/authorize/"
     TOKEN_ENDPOINT = "https://open.tiktokapis.com/v2/oauth/token/"
     USER_INFO_ENDPOINT = "https://open.tiktokapis.com/v2/user/info/"
+    CREATOR_INFO_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/creator_info/query/"
+    VIDEO_INIT_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+    STATUS_FETCH_ENDPOINT = "https://open.tiktokapis.com/v2/post/publish/status/fetch/"
 
     SCOPES = [
         "user.info.basic",
@@ -234,6 +237,26 @@ class TikTokProvider(SocialPlatformProvider):
                 "profile_url": f"https://www.tiktok.com/@{user_data.get('display_name', '')}"
             }
 
+    def get_creator_info(self, access_token: str) -> Dict[str, Any]:
+        """
+        Queries creator constraints and allowed privacy levels:
+        POST https://open.tiktokapis.com/v2/post/publish/creator_info/query/
+        """
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8"
+        }
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(self.CREATOR_INFO_ENDPOINT, headers=headers, json={})
+            if resp.status_code != 200:
+                err_msg = resp.text
+                try:
+                    err_msg = resp.json().get("error", {}).get("message", err_msg)
+                except Exception:
+                    pass
+                raise ValueError(f"TikTok Creator Info Error ({resp.status_code}): {err_msg}")
+            return resp.json().get("data", {})
+
     def validate_publishing_metadata(
         self,
         metadata: Dict[str, Any],
@@ -260,6 +283,40 @@ class TikTokProvider(SocialPlatformProvider):
 
         return (len(errors) == 0, errors)
 
+    @property
+    def is_sandbox_or_unaudited(self) -> bool:
+        """
+        Returns True if the developer app is in Sandbox, Development, or unaudited mode.
+        """
+        client_key = os.getenv("TIKTOK_CLIENT_KEY", "")
+        if client_key.startswith("sb"):
+            return True
+        if os.getenv("TIKTOK_IS_SANDBOX", "false").lower() in ("true", "1", "yes"):
+            return True
+        if os.getenv("TIKTOK_UNAUDITED", "false").lower() in ("true", "1", "yes"):
+            return True
+        return False
+
+    def check_post_status(self, access_token: str, publish_id: str) -> Dict[str, Any]:
+        """
+        Queries TikTok post publishing status:
+        POST https://open.tiktokapis.com/v2/post/publish/status/fetch/
+        """
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8"
+        }
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.post(self.STATUS_FETCH_ENDPOINT, headers=headers, json={"publish_id": publish_id})
+            if resp.status_code != 200:
+                err_text = resp.text
+                try:
+                    err_text = resp.json().get("error", {}).get("message", err_text)
+                except Exception:
+                    pass
+                return {"status": "ERROR", "error": err_text}
+            return resp.json().get("data", {})
+
     def publish_video(
         self,
         access_token: str,
@@ -268,20 +325,45 @@ class TikTokProvider(SocialPlatformProvider):
     ) -> Dict[str, Any]:
         """
         Publishes video to TikTok using official TikTok Content Posting API v2.
-        1. Initialize Video Post (`/v2/post/publish/video/init/`).
-        2. Upload binary bytes to the received upload_url.
+        1. Query creator info to check constraints & privacy levels.
+        2. Initialize Video Post (`/v2/post/publish/video/init/`).
+        3. Upload binary bytes to the received upload_url.
+        4. Poll post status (`/v2/post/publish/status/fetch/`) until confirmed.
         """
         if not os.path.exists(video_path):
             return {"success": False, "error": f"Video file not found at '{video_path}'."}
 
+        is_sandbox_app = self.is_sandbox_or_unaudited
+
+        # 1. Query creator info before video/init
+        creator_info = {}
+        try:
+            creator_info = self.get_creator_info(access_token)
+        except Exception as e:
+            return {"success": False, "error": f"Failed to query TikTok creator info: {str(e)}"}
+
+        privacy_options = creator_info.get("privacy_level_options", [])
+
+        # Enforce SELF_ONLY in Sandbox / Unaudited mode or if creator constraints require it:
+        if is_sandbox_app:
+            privacy = "SELF_ONLY"
+        else:
+            requested_privacy = metadata.get("privacy", "PUBLIC_TO_EVERYONE")
+            if privacy_options and requested_privacy in privacy_options:
+                privacy = requested_privacy
+            elif "SELF_ONLY" in privacy_options:
+                privacy = "SELF_ONLY"
+            elif privacy_options:
+                privacy = privacy_options[0]
+            else:
+                privacy = "SELF_ONLY"
+
         caption = metadata.get("caption", "AI Generated Short")[:2200]
-        privacy = metadata.get("privacy", "PUBLIC_TO_EVERYONE")
-        allow_comments = metadata.get("allow_comments", True)
-        allow_duet = metadata.get("allow_duet", True)
-        allow_stitch = metadata.get("allow_stitch", True)
+        allow_comments = metadata.get("allow_comments", True) and not creator_info.get("comment_disabled", False)
+        allow_duet = metadata.get("allow_duet", True) and not creator_info.get("duet_disabled", False)
+        allow_stitch = metadata.get("allow_stitch", True) and not creator_info.get("stitch_disabled", False)
 
         file_size = os.path.getsize(video_path)
-        init_url = "https://open.tiktokapis.com/v2/post/publish/video/init/"
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json; charset=UTF-8"
@@ -304,12 +386,16 @@ class TikTokProvider(SocialPlatformProvider):
 
         try:
             with httpx.Client(timeout=60.0) as client:
-                # 1. Initialize upload
-                init_res = client.post(init_url, headers=headers, json=body)
+                # 2. Initialize upload
+                init_res = client.post(self.VIDEO_INIT_ENDPOINT, headers=headers, json=body)
                 if init_res.status_code != 200:
                     err_msg = init_res.text
                     try:
-                        err_msg = init_res.json().get("error", {}).get("message", err_msg)
+                        err_json = init_res.json().get("error", {})
+                        err_code = err_json.get("code")
+                        err_msg = err_json.get("message", err_msg)
+                        if err_code:
+                            err_msg = f"[{err_code}] {err_msg}"
                     except Exception:
                         pass
                     return {"success": False, "error": f"TikTok API Init Error ({init_res.status_code}): {err_msg}"}
@@ -318,10 +404,10 @@ class TikTokProvider(SocialPlatformProvider):
                 publish_id = init_data.get("publish_id")
                 upload_url = init_data.get("upload_url")
 
-                if not upload_url:
-                    return {"success": False, "error": "TikTok API did not return upload_url."}
+                if not upload_url or not publish_id:
+                    return {"success": False, "error": "TikTok API did not return upload_url or publish_id."}
 
-                # 2. Upload file bytes
+                # 3. Upload file bytes
                 with open(video_path, "rb") as f:
                     video_bytes = f.read()
 
@@ -331,15 +417,60 @@ class TikTokProvider(SocialPlatformProvider):
                 }
                 upload_res = client.put(upload_url, headers=upload_headers, content=video_bytes)
 
-                if upload_res.status_code in [200, 201]:
-                    return {
-                        "success": True,
-                        "external_post_id": publish_id,
-                        "post_url": f"https://www.tiktok.com/@creator/video/{publish_id}",
-                        "error": None
-                    }
-                else:
+                if upload_res.status_code not in [200, 201]:
                     return {"success": False, "error": f"TikTok Upload Error ({upload_res.status_code}): {upload_res.text}"}
+
+                # 4. Poll Post Status (/v2/post/publish/status/fetch/)
+                import time
+                status_headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json; charset=UTF-8"
+                }
+                status_body = {"publish_id": publish_id}
+
+                creator_handle = metadata.get("account_handle") or creator_info.get("creator_username") or "creator"
+                creator_handle = creator_handle.lstrip("@")
+
+                max_attempts = 25
+                poll_interval = 2.0
+                last_status = "UNKNOWN"
+
+                for attempt in range(max_attempts):
+                    time.sleep(poll_interval)
+                    try:
+                        s_res = client.post(self.STATUS_FETCH_ENDPOINT, headers=status_headers, json=status_body)
+                        if s_res.status_code == 200:
+                            s_data = s_res.json().get("data", {})
+                            current_status = s_data.get("status")
+                            last_status = current_status
+                            if current_status == "PUBLISH_COMPLETE":
+                                post_ids = s_data.get("publicaly_available_post_id") or []
+                                public_id = post_ids[0] if (isinstance(post_ids, list) and post_ids) else None
+                                post_url = f"https://www.tiktok.com/@{creator_handle}/video/{public_id}" if public_id else f"https://www.tiktok.com/@{creator_handle}"
+                                return {
+                                    "success": True,
+                                    "external_post_id": str(publish_id),
+                                    "publish_id": publish_id,
+                                    "post_url": post_url,
+                                    "error": None
+                                }
+                            elif current_status == "FAILED":
+                                fail_reason = s_data.get("fail_reason") or "TikTok post processing failed"
+                                return {
+                                    "success": False,
+                                    "error": f"TikTok Post Processing Failed: {fail_reason}",
+                                    "publish_id": publish_id
+                                }
+                    except Exception:
+                        pass
+
+                # If still processing after polling window, report status cleanly without marking PUBLISHED
+                return {
+                    "success": False,
+                    "error": f"TikTok video processing still in progress ({last_status}). Click retry to check final status.",
+                    "publish_id": publish_id
+                }
+
         except Exception as e:
             return {"success": False, "error": f"TikTok Publish Exception: {str(e)}"}
 

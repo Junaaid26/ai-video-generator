@@ -6,7 +6,7 @@ import os
 import json
 import time
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from . import models, schemas, database
 from services.llm.agent import generate_video_plan
@@ -71,7 +71,17 @@ def _migrate_schema():
 
 _migrate_schema()
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="AI Video Automation API - Phase 5")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Serve assets folder
 os.makedirs("assets", exist_ok=True)
@@ -103,20 +113,30 @@ def health_check():
 # ---------------------------------------------------------------------- #
 @app.post("/videos/", response_model=schemas.VideoResponse)
 def create_video(video: schemas.VideoCreate, db: Session = Depends(database.get_db)):
+    prompt_text = (video.prompt or video.topic or "").strip()
+    if not prompt_text:
+        raise HTTPException(
+            status_code=422,
+            detail=[{"loc": ["body", "topic"], "msg": "Topic is required", "type": "missing"}]
+        )
+
     # 1. Create initial draft video record
     try:
         visual_style = (video.visual_style or "realistic").lower()
+        resolution = "1920x1080" if video.aspect_ratio == "16:9" else "1080x1920"
         db_video = models.Video(
-            prompt=video.prompt,
-            duration=video.duration,
-            language=video.language,
-            style=video.style,
-            target_platform=video.target_platform,
+            prompt=prompt_text,
+            duration=video.duration or "30-60 seconds",
+            language=video.language or "English",
+            style=video.style or video.tone or "Standard",
+            target_platform=video.target_platform or (video.selected_platforms[0] if video.selected_platforms else "TikTok"),
             visual_style=visual_style,
+            visual_provider=video.visual_provider,
+            selected_platforms=video.selected_platforms,
             owner_id=1,
             status=models.VideoStatus.DRAFT,
             generation_stage="NOT_STARTED",
-            resolution="1080x1920"
+            resolution=resolution
         )
         db.add(db_video)
         db.commit()
@@ -128,11 +148,11 @@ def create_video(video: schemas.VideoCreate, db: Session = Depends(database.get_
     # 2. Call LLM Service to create initial plan & script
     try:
         plan = generate_video_plan(
-            prompt=video.prompt,
-            duration=video.duration,
-            language=video.language,
-            style=video.style,
-            target_platform=video.target_platform,
+            prompt=prompt_text,
+            duration=video.duration or "30-60 seconds",
+            language=video.language or "English",
+            style=video.style or video.tone or "Standard",
+            target_platform=video.target_platform or (video.selected_platforms[0] if video.selected_platforms else "TikTok"),
             visual_style=visual_style,
         )
 
@@ -330,6 +350,10 @@ def run_video_pipeline(video_id: int):
         width, height = _parse_resolution(video.resolution or "1080x1920")
         visual_style = video.visual_style or "realistic"
         scenes = plan.get("scenes", [])
+        topic_name = plan.get("topic") or video.prompt or ""
+        for s in scenes:
+            if not s.get("topic"):
+                s["topic"] = topic_name
 
         def _persist_visual_status(status: dict):
             video.visual_generation_status = status
@@ -391,6 +415,18 @@ def run_video_pipeline(video_id: int):
             db.commit()
 
             durations = _get_scene_durations(updated_scenes)
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    import moviepy.editor as mp_ed
+                    a_clip = mp_ed.AudioFileClip(audio_path)
+                    a_dur = a_clip.duration
+                    a_clip.close()
+                    if a_dur and len(durations) > 0:
+                        per_scene = round(a_dur / len(durations), 2)
+                        durations = [per_scene] * len(durations)
+                        durations[-1] = round(a_dur - sum(durations[:-1]), 2)
+                except Exception:
+                    pass
             final_mp4 = os.path.join(base_dir, "final.mp4")
             compose_video(image_paths, durations, audio_path, srt_path, final_mp4, width, height)
             video.video_path = final_mp4
@@ -420,10 +456,23 @@ def run_video_pipeline(video_id: int):
 
 
 @app.post("/videos/{video_id}/generate")
-def start_generation(video_id: int, background_tasks: BackgroundTasks, db: Session = Depends(database.get_db)):
+def start_generation(
+    video_id: int,
+    background_tasks: BackgroundTasks,
+    options: Optional[schemas.VideoGenerateOptions] = None,
+    db: Session = Depends(database.get_db)
+):
     video = db.query(models.Video).filter(models.Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    if options:
+        if options.visual_provider:
+            video.visual_provider = options.visual_provider
+        if options.visual_style:
+            video.visual_style = options.visual_style.lower()
+        if options.selected_platforms:
+            video.selected_platforms = options.selected_platforms
 
     video.status = models.VideoStatus.GENERATING
     db.commit()
@@ -489,6 +538,20 @@ def approve_video(
 # ---------------------------------------------------------------------- #
 # Phase 5: Approve & Publish — Explicit user action
 # ---------------------------------------------------------------------- #
+def is_tiktok_sandbox_or_unaudited() -> bool:
+    """
+    Returns True if the TikTok integration is operating in Sandbox, Development, or unaudited mode.
+    """
+    client_key = os.getenv("TIKTOK_CLIENT_KEY", "")
+    if client_key.startswith("sb"):
+        return True
+    if os.getenv("TIKTOK_IS_SANDBOX", "false").lower() in ("true", "1", "yes"):
+        return True
+    if os.getenv("TIKTOK_UNAUDITED", "false").lower() in ("true", "1", "yes"):
+        return True
+    return False
+
+
 def _do_publish_platform(
     platform: str,
     video: "models.Video",
@@ -532,6 +595,36 @@ def _do_publish_platform(
         db.commit()
         return
 
+    # Proactive token expiration check & refresh before calling provider
+    if account.encrypted_refresh_token and not use_sandbox:
+        now = datetime.utcnow()
+        needs_refresh = False
+        if account.token_expires_at:
+            # Expired or expiring within 5 minutes (300s)
+            needs_refresh = account.token_expires_at <= (now + timedelta(minutes=5))
+        elif platform == "youtube" and not account.is_mock:
+            # If no expiration timestamp exists on a real account, refresh proactively
+            needs_refresh = True
+
+        if needs_refresh:
+            try:
+                refresh_tok = decrypt_token(account.encrypted_refresh_token)
+                prov = SocialProviderRegistry.get_provider(platform, use_sandbox=False)
+                refreshed = prov.refresh_access_token(refresh_tok)
+                if refreshed and refreshed.get("access_token"):
+                    account.encrypted_access_token = encrypt_token(refreshed["access_token"])
+                    if refreshed.get("refresh_token"):
+                        account.encrypted_refresh_token = encrypt_token(refreshed["refresh_token"])
+                    if refreshed.get("expires_in"):
+                        account.token_expires_at = datetime.utcnow() + timedelta(seconds=int(refreshed["expires_in"]))
+                    account.status = "ACTIVE"
+                    account.updated_at = datetime.utcnow()
+                    db.commit()
+                    db.refresh(account)
+            except Exception:
+                # If proactive refresh fails, attempt with current token or reactive handler
+                pass
+
     try:
         access_token = decrypt_token(account.encrypted_access_token)
     except Exception:
@@ -559,7 +652,17 @@ def _do_publish_platform(
     elif platform == "tiktok":
         hashtag_str = " ".join(tags_list)
         tt_caption = f"{base_caption} {hashtag_str}".strip()[:2200]
-        metadata = {"caption": tt_caption, "privacy": tiktok_privacy, "allow_comments": True, "allow_duet": True, "allow_stitch": True}
+        # Enforce SELF_ONLY if in sandbox / unaudited mode
+        effective_privacy = "SELF_ONLY" if is_tiktok_sandbox_or_unaudited() else tiktok_privacy
+        metadata = {
+            "caption": tt_caption,
+            "privacy": effective_privacy,
+            "allow_comments": True,
+            "allow_duet": True,
+            "allow_stitch": True,
+            "account_handle": account.account_handle,
+            "publish_id": pub_record.platform_post_id
+        }
     else:
         pub_record.status = models.PublicationStatus.FAILED
         pub_record.error_message = f"Unknown platform: {platform}"
@@ -570,9 +673,33 @@ def _do_publish_platform(
     try:
         provider = SocialProviderRegistry.get_provider(platform, use_sandbox=use_sandbox)
         result = provider.publish_video(access_token=access_token, video_path=video_path, metadata=metadata)
+
+        # Reactive refresh: handle 401 / stale token case safely if initial call failed
+        if not result.get("success") and account.encrypted_refresh_token and not use_sandbox:
+            err_msg = (result.get("error") or "").lower()
+            if "401" in err_msg or "invalid authentication" in err_msg or "unauthorized" in err_msg:
+                try:
+                    refresh_tok = decrypt_token(account.encrypted_refresh_token)
+                    refreshed = provider.refresh_access_token(refresh_tok)
+                    if refreshed and refreshed.get("access_token"):
+                        account.encrypted_access_token = encrypt_token(refreshed["access_token"])
+                        if refreshed.get("refresh_token"):
+                            account.encrypted_refresh_token = encrypt_token(refreshed["refresh_token"])
+                        if refreshed.get("expires_in"):
+                            account.token_expires_at = datetime.utcnow() + timedelta(seconds=int(refreshed["expires_in"]))
+                        account.status = "ACTIVE"
+                        account.updated_at = datetime.utcnow()
+                        db.commit()
+                        db.refresh(account)
+                        new_access_token = refreshed["access_token"]
+                        # Retry publishing once with refreshed token
+                        result = provider.publish_video(access_token=new_access_token, video_path=video_path, metadata=metadata)
+                except Exception:
+                    pass
+
         if result.get("success"):
             pub_record.status = models.PublicationStatus.PUBLISHED
-            pub_record.platform_post_id = result.get("external_post_id")
+            pub_record.platform_post_id = result.get("external_post_id") or result.get("publish_id")
             pub_record.post_url = result.get("post_url")
             pub_record.error_message = None
             pub_record.published_at = datetime.utcnow()
@@ -580,6 +707,8 @@ def _do_publish_platform(
             pub_record.status = models.PublicationStatus.FAILED
             raw_err = result.get("error") or "Unknown publishing error."
             pub_record.error_message = raw_err[:1000]
+            if result.get("publish_id"):
+                pub_record.platform_post_id = result.get("publish_id")
     except Exception as exc:
         pub_record.status = models.PublicationStatus.FAILED
         pub_record.error_message = f"Publishing exception: {str(exc)[:500]}"
@@ -740,6 +869,21 @@ def approve_and_publish_video(
     )
 
 
+@app.get("/publications", response_model=List[schemas.VideoPublicationResponse])
+def get_all_publications(
+    platform: Optional[str] = None,
+    status: Optional[str] = None,
+    db: Session = Depends(database.get_db)
+):
+    """Returns all publication records across all videos, optionally filtered by platform or status."""
+    q = db.query(models.VideoPublication)
+    if platform:
+        q = q.filter(models.VideoPublication.platform == platform.lower().strip())
+    if status:
+        q = q.filter(models.VideoPublication.status == status.upper().strip())
+    return q.order_by(models.VideoPublication.updated_at.desc()).all()
+
+
 @app.get("/videos/{video_id}/publications", response_model=List[schemas.VideoPublicationResponse])
 def get_video_publications(
     video_id: int,
@@ -795,6 +939,10 @@ def retry_platform_publication(
 
     _do_publish_platform(platform=pub.platform, video=video, pub_record=pub, db=db, use_sandbox=use_sandbox)
     db.refresh(pub)
+    if pub.status == models.PublicationStatus.PUBLISHED:
+        video.status = models.VideoStatus.PUBLISHED
+        video.updated_at = datetime.utcnow()
+        db.commit()
     return pub
 
 
@@ -1144,15 +1292,19 @@ def _cleanup_expired_pkce_verifiers(ttl_seconds: int = 900) -> None:
 
 
 @app.get("/social/oauth/authorize/{platform}")
+@app.get("/social/oauth/{platform}/authorize")
 def get_social_oauth_authorization_url(
     platform: str,
-    redirect_uri: str = Query(..., description="Redirect URI for OAuth callback"),
+    redirect_uri: Optional[str] = Query(None, description="Redirect URI for OAuth callback"),
     sandbox: bool = Query(False, description="Use sandbox mock provider instead of official API")
 ):
     """
     Generates official OAuth consent URL (or sandbox redirect) for the platform.
     """
     try:
+        if not redirect_uri:
+            redirect_uri = f"http://localhost:8000/social/oauth/callback/{platform.lower().strip()}"
+
         provider = SocialProviderRegistry.get_provider(platform, use_sandbox=sandbox)
         csrf_state = secrets.token_urlsafe(16)
 
@@ -1174,6 +1326,7 @@ def get_social_oauth_authorization_url(
 
 
 @app.get("/social/oauth/callback/{platform}")
+@app.get("/social/oauth/{platform}/callback")
 def handle_social_oauth_callback(
     request: Request,
     platform: str,
@@ -1189,20 +1342,43 @@ def handle_social_oauth_callback(
     Exchanges OAuth code for access/refresh tokens, gets channel/profile info,
     encrypts credentials, and persists to social_accounts table.
 
-    redirect_uri is optional: Google's real OAuth callback does NOT echo it back
+    redirect_uri is optional: Google/Meta OAuth callback does NOT echo it back
     as a query parameter. When absent, it is derived from the request's own URL
     (scheme + host + path, without query string) — which is exactly the registered
     redirect URI that was used during the authorize step.
     """
+    is_browser_request = "text/html" in request.headers.get("accept", "")
+
     # 1. Handle error response from OAuth provider
     if error:
         err_msg = f"OAuth provider error: {error}"
         if error_description:
             err_msg += f" - {error_description}"
+        if is_browser_request:
+            from starlette.responses import HTMLResponse
+            return HTMLResponse(
+                f"""<!DOCTYPE html><html><body style="background:#0F0F12;color:#F7F4F5;font-family:sans-serif;padding:40px;text-align:center;">
+                <div style="max-width:500px;margin:auto;background:#15151B;padding:30px;border-radius:12px;border:1px solid #5B2129;">
+                <h2 style="color:#E05260;">Connection Error</h2><p>{err_msg}</p>
+                <a href="http://localhost:5173/?tab=social" style="color:#FFF;background:#C62845;padding:10px 20px;border-radius:8px;text-decoration:none;">Back to Studio</a>
+                </div></body></html>""",
+                status_code=400
+            )
         raise HTTPException(status_code=400, detail=err_msg)
 
     if not code:
-        raise HTTPException(status_code=400, detail="Missing authorization code from OAuth provider.")
+        err_msg = "Missing authorization code from OAuth provider."
+        if is_browser_request:
+            from starlette.responses import HTMLResponse
+            return HTMLResponse(
+                f"""<!DOCTYPE html><html><body style="background:#0F0F12;color:#F7F4F5;font-family:sans-serif;padding:40px;text-align:center;">
+                <div style="max-width:500px;margin:auto;background:#15151B;padding:30px;border-radius:12px;border:1px solid #5B2129;">
+                <h2 style="color:#E05260;">Connection Error</h2><p>{err_msg}</p>
+                <a href="http://localhost:5173/?tab=social" style="color:#FFF;background:#C62845;padding:10px 20px;border-radius:8px;text-decoration:none;">Back to Studio</a>
+                </div></body></html>""",
+                status_code=400
+            )
+        raise HTTPException(status_code=400, detail=err_msg)
 
     # 2. Derive the redirect_uri from this request's own URL when not explicitly provided
     if not redirect_uri:
@@ -1267,11 +1443,31 @@ def handle_social_oauth_callback(
         account.status = "ACTIVE"
         account.metadata_json = {
             "avatar_url": info.get("avatar_url"),
-            "profile_url": info.get("profile_url")
+            "profile_url": info.get("profile_url"),
+            "page_name": info.get("page_name"),
+            "page_id": info.get("page_id")
         }
         account.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(account)
+
+        if is_browser_request:
+            from starlette.responses import HTMLResponse
+            return HTMLResponse(
+                f"""<!DOCTYPE html><html>
+                <head>
+                    <meta http-equiv="refresh" content="1;url=http://localhost:5173/?tab=social&connected={platform.lower()}">
+                    <title>{platform.title()} Connected</title>
+                </head>
+                <body style="background:#0F0F12;color:#F7F4F5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+                    <div style="background:#15151B;border:1px solid #2B2B35;border-radius:16px;padding:36px;text-align:center;max-width:440px;box-shadow:0 10px 30px rgba(0,0,0,0.5);">
+                        <div style="font-size:36px;margin-bottom:12px;">🎉</div>
+                        <h2 style="font-size:20px;font-weight:700;margin:0 0 8px 0;color:#F7F4F5;">{platform.title()} Connected!</h2>
+                        <p style="font-size:13px;color:#A9A4AA;margin:0 0 20px 0;">Account <strong>{account.account_handle or account.account_name}</strong> has been linked successfully.</p>
+                        <a href="http://localhost:5173/?tab=social&connected={platform.lower()}" style="display:inline-block;background:#C62845;color:#FFF;padding:10px 24px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;">Return to Studio</a>
+                    </div>
+                </body></html>"""
+            )
 
         return {
             "id": account.id,
@@ -1284,7 +1480,18 @@ def handle_social_oauth_callback(
             "created_at": account.created_at
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"OAuth connection failed: {str(e)}")
+        err_detail = f"OAuth connection failed: {str(e)}"
+        if is_browser_request:
+            from starlette.responses import HTMLResponse
+            return HTMLResponse(
+                f"""<!DOCTYPE html><html><body style="background:#0F0F12;color:#F7F4F5;font-family:sans-serif;padding:40px;text-align:center;">
+                <div style="max-width:500px;margin:auto;background:#15151B;padding:30px;border-radius:12px;border:1px solid #5B2129;">
+                <h2 style="color:#E05260;">Connection Error</h2><p style="font-size:13px;color:#F7F4F5;">{err_detail}</p>
+                <a href="http://localhost:5173/?tab=social" style="color:#FFF;background:#C62845;padding:10px 20px;border-radius:8px;text-decoration:none;">Back to Studio</a>
+                </div></body></html>""",
+                status_code=400
+            )
+        raise HTTPException(status_code=400, detail=err_detail)
 
 
 @app.post("/social/accounts/sandbox", response_model=schemas.SocialAccountResponse)

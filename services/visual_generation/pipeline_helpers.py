@@ -6,6 +6,10 @@ from typing import Callable, Optional
 
 from services.visual_generation import VisualGenerationService, build_consistency_context
 from services.visual_generation.base import VisualGenerationRequest, validate_generated_image
+from services.visual_generation.prompt_builder import (
+    validate_visual_prompt_grounding,
+    regenerate_grounded_visual_prompt,
+)
 
 
 def init_visual_status(scenes: list) -> dict:
@@ -79,6 +83,28 @@ def generate_scene_visuals(
         if status_callback:
             status_callback(visual_status)
 
+        topic = scene.get("topic") or (db_session.query(video_model).filter(video_model.id == video_id).first().prompt if video_model else "") or ""
+        claim = scene.get("claim") or ""
+        narration = scene.get("narration") or ""
+        v_prompt = scene.get("visual_prompt") or scene.get("visual_description", "")
+        style = scene.get("visual_style") or visual_style
+
+        # Semantic validation & repair before image generation
+        is_valid, reason = validate_visual_prompt_grounding(
+            topic=topic,
+            claim=claim,
+            narration=narration,
+            visual_prompt=v_prompt,
+        )
+        if not is_valid:
+            v_prompt = regenerate_grounded_visual_prompt(
+                topic=topic,
+                claim=claim,
+                narration=narration,
+                visual_style=style,
+            )
+            print(f"[Semantic Validation] Scene {scene_num}: Auto-repairing ungrounded prompt -> {v_prompt}")
+
         # Upsert SceneAsset record
         asset = (
             db_session.query(scene_asset_model)
@@ -97,17 +123,16 @@ def generate_scene_visuals(
             db_session.add(asset)
 
         asset.status = "generating"
-        asset.visual_prompt = scene.get("visual_prompt") or scene.get("visual_description", "")
+        asset.visual_prompt = v_prompt
         asset.updated_at = datetime.utcnow()
         db_session.commit()
 
         output_path = scene_image_path(base_dir, scene_num)
         consistency = build_consistency_context(scenes, scene_num)
-        style = scene.get("visual_style") or visual_style
 
         request = VisualGenerationRequest(
             scene_number=scene_num,
-            visual_prompt=scene.get("visual_prompt") or scene.get("visual_description", ""),
+            visual_prompt=v_prompt,
             environment=scene.get("environment", ""),
             characters=scene.get("characters", ""),
             objects=scene.get("objects", ""),
@@ -117,11 +142,16 @@ def generate_scene_visuals(
             width=width,
             height=height,
             output_path=output_path,
+            topic=topic,
+            claim=claim,
+            narration=narration,
         )
 
         result = service.generate_scene(request)
 
         scene_copy = dict(scene)
+        scene_copy["visual_prompt"] = v_prompt
+        scene_copy["visual_description"] = v_prompt
         if result.success:
             scene_copy["image_path"] = output_path
             scene_copy["image_url"] = scene_image_url(video_id, scene_num)
@@ -176,6 +206,25 @@ def regenerate_single_scene(
     consistency = build_consistency_context(all_scenes, scene_number)
     style = scene.get("visual_style") or visual_style
 
+    topic = scene.get("topic") or ""
+    claim = scene.get("claim") or ""
+    narration = scene.get("narration") or ""
+    v_prompt = scene.get("visual_prompt") or scene.get("visual_description", "")
+
+    is_valid, reason = validate_visual_prompt_grounding(
+        topic=topic,
+        claim=claim,
+        narration=narration,
+        visual_prompt=v_prompt,
+    )
+    if not is_valid:
+        v_prompt = regenerate_grounded_visual_prompt(
+            topic=topic,
+            claim=claim,
+            narration=narration,
+            visual_style=style,
+        )
+
     asset = (
         db_session.query(scene_asset_model)
         .filter(
@@ -193,12 +242,13 @@ def regenerate_single_scene(
         db_session.add(asset)
 
     asset.status = "generating"
+    asset.visual_prompt = v_prompt
     asset.updated_at = datetime.utcnow()
     db_session.commit()
 
     request = VisualGenerationRequest(
         scene_number=scene_number,
-        visual_prompt=scene.get("visual_prompt") or scene.get("visual_description", ""),
+        visual_prompt=v_prompt,
         environment=scene.get("environment", ""),
         characters=scene.get("characters", ""),
         objects=scene.get("objects", ""),
@@ -208,6 +258,9 @@ def regenerate_single_scene(
         width=width,
         height=height,
         output_path=output_path,
+        topic=topic,
+        claim=claim,
+        narration=narration,
     )
 
     result = service.generate_scene(request)
